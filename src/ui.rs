@@ -271,7 +271,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 fn issue_editor_lines(editor: &crate::app::EditorState, intro: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(intro.to_string()),
-        Line::from("Enter saves. Esc cancels. s/p cycle status and priority."),
+        Line::from("Enter saves. Esc cancels. Ctrl+S/Ctrl+P cycle status and priority."),
         Line::from(""),
         field_line("title", editor.focus, EditorFocus::Title, &editor.title),
         field_line(

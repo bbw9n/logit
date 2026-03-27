@@ -177,7 +177,8 @@ impl App {
             search: String::new(),
         });
         self.status_message =
-            "Creating a local issue. Tab moves fields, s/p cycle status and priority.".into();
+            "Creating a local issue. Tab moves fields, Ctrl+S/Ctrl+P cycle status and priority."
+                .into();
     }
 
     pub fn begin_edit_editor(&mut self) {
@@ -408,14 +409,14 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('s') if key.modifiers.is_empty() => {
+            KeyCode::Char('s') if key.modifiers == KeyModifiers::CONTROL => {
                 if let Some(editor) = self.editor.as_mut() {
                     if !matches!(editor.mode, EditorMode::Search) {
                         editor.status = editor.status.cycle();
                     }
                 }
             }
-            KeyCode::Char('p') if key.modifiers.is_empty() => {
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                 if let Some(editor) = self.editor.as_mut() {
                     if !matches!(editor.mode, EditorMode::Search) {
                         editor.priority = editor.priority.cycle();
@@ -615,4 +616,58 @@ fn parse_labels(value: &str) -> Vec<String> {
         .filter(|label| !label.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::WorkspaceConfig, store::Store};
+    use std::path::PathBuf;
+
+    fn test_app() -> Result<App> {
+        let config = WorkspaceConfig {
+            data_dir: PathBuf::from("/tmp/logit-test"),
+            database_path: PathBuf::from("/tmp/logit-test/logit.db"),
+            linear_api_token: None,
+            workspace_name: "Test Workspace".into(),
+        };
+        let store = Store::open_in_memory()?;
+        let sync_service = LinearSyncService::new(config.clone());
+        Ok(App {
+            config,
+            issues: Vec::new(),
+            selected: 0,
+            query: IssueQuery::default(),
+            status_message: String::new(),
+            queued_mutation_count: 0,
+            editor: None,
+            show_help: false,
+            store,
+            sync_service,
+        })
+    }
+
+    #[test]
+    fn typing_s_in_editor_inserts_text() -> Result<()> {
+        let mut app = test_app()?;
+        app.begin_create_editor();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))?;
+
+        let editor = app.editor.expect("editor should still be open");
+        assert_eq!(editor.title, "s");
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_s_cycles_status_in_editor() -> Result<()> {
+        let mut app = test_app()?;
+        app.begin_create_editor();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))?;
+
+        let editor = app.editor.expect("editor should still be open");
+        assert_eq!(editor.status, crate::domain::IssueStatus::InProgress);
+        Ok(())
+    }
 }
