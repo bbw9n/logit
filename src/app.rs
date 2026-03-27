@@ -630,6 +630,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/logit-test/logit.db"),
             linear_api_token: None,
             workspace_name: "Test Workspace".into(),
+            theme: None,
         };
         let store = Store::open_in_memory()?;
         let sync_service = LinearSyncService::new(config.clone());

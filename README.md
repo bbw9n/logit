@@ -97,6 +97,25 @@ Optional environment variable:
 
 - `LINEAR_API_KEY`: enables the current sync code path
 
+Optional config file:
+
+- `~/.config/logit/config.toml`
+
+Example:
+
+```toml
+workspace_name = "Personal Workspace"
+theme = "nord"
+```
+
+If `theme` is omitted, `logit` falls back to your terminal’s native colors.
+
+Available theme presets:
+
+- `nord`
+- `sunset`
+- `forest`
+
 ## Architecture
 
 High-level structure:

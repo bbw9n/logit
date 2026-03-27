@@ -94,6 +94,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/logit-test/logit.db"),
             linear_api_token: token.map(str::to_string),
             workspace_name: "Test Workspace".into(),
+            theme: None,
         }
     }
 
