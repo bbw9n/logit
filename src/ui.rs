@@ -43,10 +43,7 @@ fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(
-                    " Issues ({}) ",
-                    app.query_summary()
-                ))
+                .title(format!(" Issues ({}) ", app.query_summary()))
                 .borders(Borders::ALL),
         )
         .highlight_style(
