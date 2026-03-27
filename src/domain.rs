@@ -83,6 +83,27 @@ pub struct Issue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueDraft {
+    pub title: String,
+    pub description: String,
+    pub status: IssueStatus,
+    pub priority: Priority,
+    pub assignee: Option<String>,
+}
+
+impl IssueDraft {
+    pub fn new(title: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            description: description.into(),
+            status: IssueStatus::Todo,
+            priority: Priority::Medium,
+            assignee: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuePatch {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -101,6 +122,13 @@ impl IssuePatch {
             assignee: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IssueQuery {
+    pub unsynced_only: bool,
+    pub status: Option<IssueStatus>,
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

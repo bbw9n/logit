@@ -1,6 +1,6 @@
 use crate::{
     config::WorkspaceConfig,
-    domain::{Issue, IssuePatch, SyncState},
+    domain::{Issue, IssueDraft, IssuePatch, IssueQuery, SyncState},
     store::Store,
     sync::{LinearSyncService, SyncService},
 };
@@ -65,10 +65,10 @@ impl App {
 
     pub fn create_issue(&mut self) -> Result<()> {
         let count = self.queued_mutation_count + 1;
-        let issue = self.store.create_issue(
-            &format!("Local draft issue #{count}"),
+        let issue = self.store.create_issue(&IssueDraft::new(
+            format!("Local draft issue #{count}"),
             "Created from the TUI while offline. Press y to attempt sync once LINEAR_API_KEY is available.",
-        )?;
+        ))?;
         self.reload()?;
         self.select_issue(issue.local_id);
         self.status_message = format!("Created {} and queued it for sync", issue.identifier);
@@ -134,8 +134,25 @@ impl App {
         Ok(())
     }
 
+    pub fn delete_current_issue(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let deleted = self.store.delete_issue(issue.local_id)?;
+        self.reload()?;
+        self.status_message = if deleted {
+            format!("Deleted {}", issue.identifier)
+        } else {
+            format!("Could not delete {}", issue.identifier)
+        };
+        Ok(())
+    }
+
     fn reload(&mut self) -> Result<()> {
-        self.issues = self.store.list_issues(self.unsynced_only)?;
+        self.issues = self.store.list_issues(&IssueQuery {
+            unsynced_only: self.unsynced_only,
+            ..IssueQuery::default()
+        })?;
         self.queued_mutation_count = self.store.list_pending_mutations()?.len();
         if self.issues.is_empty() {
             self.selected = 0;

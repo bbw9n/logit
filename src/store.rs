@@ -1,5 +1,6 @@
 use crate::domain::{
-    Issue, IssuePatch, IssueStatus, Priority, QueuedMutation, QueuedMutationKind, SyncState,
+    Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, Priority, QueuedMutation,
+    QueuedMutationKind, SyncState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -14,24 +15,43 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite database at {}", path.display()))?;
-        let store = Self { conn };
-        store.migrate()?;
-        store.seed()?;
-        Ok(store)
+        Self::from_connection(conn, true)
     }
 
-    pub fn list_issues(&self, unsynced_only: bool) -> Result<Vec<Issue>> {
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?, false)
+    }
+
+    pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
             "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at
-             FROM issues",
+             FROM issues WHERE 1 = 1",
         );
-        if unsynced_only {
-            sql.push_str(" WHERE sync_state != 'synced'");
+        let mut params = Vec::new();
+
+        if query.unsynced_only {
+            sql.push_str(" AND sync_state != 'synced'");
+        }
+        if let Some(status) = &query.status {
+            sql.push_str(" AND status = ?");
+            params.push(encode_status(status).to_string());
+        }
+        if let Some(search) = query
+            .search
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            sql.push_str(" AND (identifier LIKE ? OR title LIKE ? OR description LIKE ?)");
+            let pattern = format!("%{}%", search.trim());
+            params.push(pattern.clone());
+            params.push(pattern.clone());
+            params.push(pattern);
         }
         sql.push_str(" ORDER BY updated_at DESC, local_id DESC");
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_issue_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map_issue_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -48,12 +68,19 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn create_issue(&self, title: &str, description: &str) -> Result<Issue> {
+    pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
             "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, 'todo', 'medium', NULL, 'pending_create', ?3)",
-            params![title, description, now.to_rfc3339()],
+             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, 'pending_create', ?6)",
+            params![
+                draft.title,
+                draft.description,
+                encode_status(&draft.status),
+                encode_priority(&draft.priority),
+                draft.assignee,
+                now.to_rfc3339()
+            ],
         )?;
         let local_id = self.conn.last_insert_rowid();
         let identifier = format!("LOCAL-{local_id}");
@@ -149,6 +176,26 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_issue(&self, local_id: i64) -> Result<bool> {
+        for mutation in self.list_pending_mutations()? {
+            let matches_issue = match mutation.kind {
+                QueuedMutationKind::CreateIssue { issue_local_id } => issue_local_id == local_id,
+                QueuedMutationKind::UpdateIssue { issue_local_id, .. } => {
+                    issue_local_id == local_id
+                }
+            };
+
+            if matches_issue {
+                self.delete_mutation(mutation.id)?;
+            }
+        }
+
+        let deleted = self
+            .conn
+            .execute("DELETE FROM issues WHERE local_id = ?1", [local_id])?;
+        Ok(deleted > 0)
+    }
+
     pub fn mark_issue_synced(
         &self,
         local_id: i64,
@@ -195,6 +242,15 @@ impl Store {
             [],
         )?;
         Ok(count)
+    }
+
+    fn from_connection(conn: Connection, seed: bool) -> Result<Self> {
+        let store = Self { conn };
+        store.migrate()?;
+        if seed {
+            store.seed()?;
+        }
+        Ok(store)
     }
 
     fn enqueue(&self, mutation: QueuedMutationKind) -> Result<()> {
@@ -249,6 +305,138 @@ impl Store {
             [now],
         )?;
         self.enqueue(QueuedMutationKind::CreateIssue { issue_local_id: 2 })?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_crud_round_trip_works() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let draft = IssueDraft::new("Write the CRUD layer", "Back the TUI with SQLite.");
+
+        let created = store.create_issue(&draft)?;
+        assert_eq!(created.identifier, "LOCAL-1");
+        assert_eq!(created.sync_state, SyncState::PendingCreate);
+
+        let fetched = store
+            .get_issue(created.local_id)?
+            .expect("issue should exist");
+        assert_eq!(fetched.title, draft.title);
+
+        let mut patch = IssuePatch::empty();
+        patch.title = Some("Write and test the CRUD layer".into());
+        patch.status = Some(IssueStatus::InProgress);
+        let updated = store.update_issue(created.local_id, &patch)?;
+        assert_eq!(updated.title, "Write and test the CRUD layer");
+        assert_eq!(updated.status, IssueStatus::InProgress);
+
+        assert!(store.delete_issue(created.local_id)?);
+        assert!(store.get_issue(created.local_id)?.is_none());
+        assert!(store.list_pending_mutations()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn issue_query_filters_unsynced_status_and_search() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let local = store.create_issue(&IssueDraft::new(
+            "Offline draft",
+            "Only local until Linear sync is enabled.",
+        ))?;
+        let synced = store.create_issue(&IssueDraft::new(
+            "Remote-backed issue",
+            "Already synced to Linear.",
+        ))?;
+        store.mark_issue_synced(synced.local_id, Some("lin_1"), Some("ENG-1"))?;
+
+        let unsynced = store.list_issues(&IssueQuery {
+            unsynced_only: true,
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(unsynced.len(), 1);
+        assert_eq!(unsynced[0].local_id, local.local_id);
+
+        let in_progress = {
+            let mut patch = IssuePatch::empty();
+            patch.status = Some(IssueStatus::InProgress);
+            store.update_issue(local.local_id, &patch)?
+        };
+        let filtered = store.list_issues(&IssueQuery {
+            status: Some(IssueStatus::InProgress),
+            search: Some("offline".into()),
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].local_id, in_progress.local_id);
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_issue_cleans_up_queued_mutations() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let issue = store.create_issue(&IssueDraft::new("Delete me", "Queued for creation"))?;
+        assert_eq!(store.list_pending_mutations()?.len(), 1);
+
+        assert!(store.delete_issue(issue.local_id)?);
+        assert!(store.list_pending_mutations()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn updating_synced_issue_creates_update_mutation() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let issue = store.create_issue(&IssueDraft::new("Synced issue", "Already in Linear"))?;
+        store.mark_issue_synced(issue.local_id, Some("lin_42"), Some("ENG-42"))?;
+        for mutation in store.list_pending_mutations()? {
+            store.delete_mutation(mutation.id)?;
+        }
+        assert!(store.list_pending_mutations()?.is_empty());
+
+        let mut patch = IssuePatch::empty();
+        patch.priority = Some(Priority::High);
+        let updated = store.update_issue(issue.local_id, &patch)?;
+
+        assert_eq!(updated.sync_state, SyncState::PendingUpdate);
+        let pending = store.list_pending_mutations()?;
+        assert_eq!(pending.len(), 1);
+        match &pending[0].kind {
+            QueuedMutationKind::UpdateIssue {
+                issue_local_id,
+                patch,
+            } => {
+                assert_eq!(*issue_local_id, issue.local_id);
+                assert_eq!(patch.priority, Some(Priority::High));
+            }
+            other => panic!("expected update mutation, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_failed_sync_restores_expected_pending_state() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let local = store.create_issue(&IssueDraft::new("Local", "Still local"))?;
+        let synced = store.create_issue(&IssueDraft::new("Remote", "Was synced before"))?;
+        store.mark_issue_synced(synced.local_id, Some("lin_77"), Some("ENG-77"))?;
+
+        store.mark_issue_sync_error(local.local_id)?;
+        store.mark_issue_sync_error(synced.local_id)?;
+        let retried = store.retry_failed_mutations()?;
+        assert_eq!(retried, 2);
+
+        let local_issue = store
+            .get_issue(local.local_id)?
+            .expect("local issue missing");
+        let synced_issue = store
+            .get_issue(synced.local_id)?
+            .expect("synced issue missing");
+
+        assert_eq!(local_issue.sync_state, SyncState::PendingCreate);
+        assert_eq!(synced_issue.sync_state, SyncState::PendingUpdate);
         Ok(())
     }
 }

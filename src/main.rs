@@ -44,6 +44,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
                 KeyCode::Char('n') => app.create_issue()?,
                 KeyCode::Char('s') => app.cycle_status()?,
                 KeyCode::Char('e') => app.touch_title()?,
+                KeyCode::Char('d') => app.delete_current_issue()?,
                 KeyCode::Char('y') => app.sync_now()?,
                 KeyCode::Char('r') => app.retry_failed_sync()?,
                 KeyCode::Char('/') => app.toggle_filter(),

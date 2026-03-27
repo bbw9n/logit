@@ -140,6 +140,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Line::from("n              new issue"),
         Line::from("s              cycle status"),
         Line::from("e              edit title"),
+        Line::from("d              delete issue"),
         Line::from("y              sync now"),
         Line::from("r              retry errors"),
         Line::from("/              toggle filter"),
