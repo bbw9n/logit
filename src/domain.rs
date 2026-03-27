@@ -85,6 +85,8 @@ pub struct Issue {
     pub identifier: String,
     pub title: String,
     pub description: String,
+    pub project: Option<String>,
+    pub labels: Vec<String>,
     pub status: IssueStatus,
     pub priority: Priority,
     pub assignee: Option<String>,
@@ -97,6 +99,8 @@ pub struct Issue {
 pub struct IssueDraft {
     pub title: String,
     pub description: String,
+    pub project: Option<String>,
+    pub labels: Vec<String>,
     pub status: IssueStatus,
     pub priority: Priority,
     pub assignee: Option<String>,
@@ -107,6 +111,8 @@ impl IssueDraft {
         Self {
             title: title.into(),
             description: description.into(),
+            project: None,
+            labels: Vec::new(),
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             assignee: None,
@@ -118,6 +124,8 @@ impl IssueDraft {
 pub struct IssuePatch {
     pub title: Option<String>,
     pub description: Option<String>,
+    pub project: Option<Option<String>>,
+    pub labels: Option<Vec<String>>,
     pub status: Option<IssueStatus>,
     pub priority: Option<Priority>,
     pub assignee: Option<Option<String>>,
@@ -129,6 +137,8 @@ impl IssuePatch {
         Self {
             title: None,
             description: None,
+            project: None,
+            labels: None,
             status: None,
             priority: None,
             assignee: None,
@@ -141,6 +151,7 @@ impl IssuePatch {
 pub struct IssueQuery {
     pub unsynced_only: bool,
     pub include_archived: bool,
+    pub archived_only: bool,
     pub status: Option<IssueStatus>,
     pub search: Option<String>,
 }

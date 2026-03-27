@@ -11,6 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum EditorFocus {
     Title,
     Description,
+    Project,
+    Labels,
     Assignee,
 }
 
@@ -18,7 +20,9 @@ impl EditorFocus {
     fn next(self) -> Self {
         match self {
             Self::Title => Self::Description,
-            Self::Description => Self::Assignee,
+            Self::Description => Self::Project,
+            Self::Project => Self::Labels,
+            Self::Labels => Self::Assignee,
             Self::Assignee => Self::Title,
         }
     }
@@ -27,7 +31,9 @@ impl EditorFocus {
         match self {
             Self::Title => Self::Assignee,
             Self::Description => Self::Title,
-            Self::Assignee => Self::Description,
+            Self::Project => Self::Description,
+            Self::Labels => Self::Project,
+            Self::Assignee => Self::Labels,
         }
     }
 }
@@ -45,6 +51,8 @@ pub struct EditorState {
     pub focus: EditorFocus,
     pub title: String,
     pub description: String,
+    pub project: String,
+    pub labels: String,
     pub assignee: String,
     pub status: crate::domain::IssueStatus,
     pub priority: Priority,
@@ -59,6 +67,7 @@ pub struct App {
     pub status_message: String,
     pub queued_mutation_count: usize,
     pub editor: Option<EditorState>,
+    pub show_help: bool,
     store: Store,
     sync_service: LinearSyncService,
 }
@@ -76,6 +85,7 @@ impl App {
             status_message: String::from("Offline-first issue tracking ready"),
             queued_mutation_count: 0,
             editor: None,
+            show_help: false,
             store,
             sync_service,
         };
@@ -91,6 +101,10 @@ impl App {
         if self.editor.is_some() {
             return self.handle_editor_key(key);
         }
+        if self.show_help && key.code == KeyCode::Esc {
+            self.toggle_help();
+            return Ok(false);
+        }
 
         match key.code {
             KeyCode::Char('q') => return Ok(true),
@@ -102,6 +116,10 @@ impl App {
             KeyCode::Char('p') => self.cycle_priority()?,
             KeyCode::Char('a') => self.toggle_archive_current_issue()?,
             KeyCode::Char('v') => self.toggle_archived_visibility(),
+            KeyCode::Char('1') => self.set_saved_view(SavedView::Active),
+            KeyCode::Char('2') => self.set_saved_view(SavedView::Unsynced),
+            KeyCode::Char('3') => self.set_saved_view(SavedView::Archived),
+            KeyCode::Char('?') => self.toggle_help(),
             KeyCode::Char('y') => self.sync_now()?,
             KeyCode::Char('r') => self.retry_failed_sync()?,
             KeyCode::Char('/') => self.begin_search_editor(),
@@ -131,8 +149,17 @@ impl App {
 
     pub fn toggle_unsynced_filter(&mut self) {
         self.query.unsynced_only = !self.query.unsynced_only;
+        if self.query.unsynced_only {
+            self.query.archived_only = false;
+        }
         if let Err(error) = self.reload() {
             self.status_message = format!("Failed to reload issues: {error:#}");
+        } else {
+            self.status_message = if self.query.unsynced_only {
+                "Showing only unsynced issues".into()
+            } else {
+                "Showing synced and unsynced issues".into()
+            };
         }
     }
 
@@ -142,6 +169,8 @@ impl App {
             focus: EditorFocus::Title,
             title: String::new(),
             description: String::new(),
+            project: String::new(),
+            labels: String::new(),
             assignee: String::new(),
             status: crate::domain::IssueStatus::Todo,
             priority: Priority::Medium,
@@ -163,6 +192,8 @@ impl App {
             focus: EditorFocus::Title,
             title: issue.title.clone(),
             description: issue.description.clone(),
+            project: issue.project.clone().unwrap_or_default(),
+            labels: issue.labels.join(", "),
             assignee: issue.assignee.clone().unwrap_or_default(),
             status: issue.status.clone(),
             priority: issue.priority.clone(),
@@ -177,12 +208,15 @@ impl App {
             focus: EditorFocus::Title,
             title: String::new(),
             description: String::new(),
+            project: String::new(),
+            labels: String::new(),
             assignee: String::new(),
             status: crate::domain::IssueStatus::Todo,
             priority: Priority::Medium,
             search: self.query.search.clone().unwrap_or_default(),
         });
-        self.status_message = "Search issues by title, identifier, or description".into();
+        self.status_message =
+            "Search issues by title, identifier, description, project, or labels".into();
     }
 
     pub fn cycle_status(&mut self) -> Result<()> {
@@ -266,6 +300,9 @@ impl App {
 
     pub fn toggle_archived_visibility(&mut self) {
         self.query.include_archived = !self.query.include_archived;
+        if !self.query.include_archived {
+            self.query.archived_only = false;
+        }
         if let Err(error) = self.reload() {
             self.status_message = format!("Failed to reload issues: {error:#}");
         } else if self.query.include_archived {
@@ -284,19 +321,26 @@ impl App {
         }
     }
 
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        self.status_message = if self.show_help {
+            "Help overlay open. Press ? or Esc to close it.".into()
+        } else {
+            "Help overlay closed".into()
+        };
+    }
+
     pub fn query_summary(&self) -> String {
         let search = self.query.search.as_deref().unwrap_or("none");
         format!(
-            "archived: {} | unsynced: {} | search: {}",
-            if self.query.include_archived {
+            "view: {} | archived: {} | search: {}",
+            self.saved_view_label(),
+            if self.query.archived_only {
+                "only"
+            } else if self.query.include_archived {
                 "shown"
             } else {
                 "hidden"
-            },
-            if self.query.unsynced_only {
-                "only"
-            } else {
-                "all"
             },
             search
         )
@@ -351,6 +395,12 @@ impl App {
                             EditorFocus::Description => {
                                 editor.description.pop();
                             }
+                            EditorFocus::Project => {
+                                editor.project.pop();
+                            }
+                            EditorFocus::Labels => {
+                                editor.labels.pop();
+                            }
                             EditorFocus::Assignee => {
                                 editor.assignee.pop();
                             }
@@ -381,6 +431,8 @@ impl App {
                         _ => match editor.focus {
                             EditorFocus::Title => editor.title.push(ch),
                             EditorFocus::Description => editor.description.push(ch),
+                            EditorFocus::Project => editor.project.push(ch),
+                            EditorFocus::Labels => editor.labels.push(ch),
                             EditorFocus::Assignee => editor.assignee.push(ch),
                         },
                     }
@@ -426,6 +478,8 @@ impl App {
                 let mut draft = IssueDraft::new(title, description);
                 draft.status = editor.status;
                 draft.priority = editor.priority;
+                draft.project = empty_to_none(&editor.project);
+                draft.labels = parse_labels(&editor.labels);
                 draft.assignee = empty_to_none(&editor.assignee);
                 let issue = self.store.create_issue(&draft)?;
                 self.reload()?;
@@ -445,6 +499,8 @@ impl App {
                     editor.title.trim().to_string()
                 });
                 patch.description = Some(editor.description.trim().to_string());
+                patch.project = Some(empty_to_none(&editor.project));
+                patch.labels = Some(parse_labels(&editor.labels));
                 patch.assignee = Some(empty_to_none(&editor.assignee));
                 patch.status = Some(editor.status);
                 patch.priority = Some(editor.priority);
@@ -457,6 +513,42 @@ impl App {
 
         self.editor = None;
         Ok(())
+    }
+
+    fn set_saved_view(&mut self, view: SavedView) {
+        match view {
+            SavedView::Active => {
+                self.query.unsynced_only = false;
+                self.query.include_archived = false;
+                self.query.archived_only = false;
+                self.status_message = "Switched to active issues".into();
+            }
+            SavedView::Unsynced => {
+                self.query.unsynced_only = true;
+                self.query.include_archived = false;
+                self.query.archived_only = false;
+                self.status_message = "Switched to unsynced issues".into();
+            }
+            SavedView::Archived => {
+                self.query.unsynced_only = false;
+                self.query.include_archived = true;
+                self.query.archived_only = true;
+                self.status_message = "Switched to archived issues".into();
+            }
+        }
+        if let Err(error) = self.reload() {
+            self.status_message = format!("Failed to switch view: {error:#}");
+        }
+    }
+
+    fn saved_view_label(&self) -> &'static str {
+        if self.query.archived_only {
+            "archived"
+        } else if self.query.unsynced_only {
+            "unsynced"
+        } else {
+            "active"
+        }
     }
 
     fn select_issue(&mut self, local_id: i64) {
@@ -500,6 +592,13 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SavedView {
+    Active,
+    Unsynced,
+    Archived,
+}
+
 fn empty_to_none(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -507,4 +606,13 @@ fn empty_to_none(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn parse_labels(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }

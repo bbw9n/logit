@@ -25,13 +25,16 @@ impl Store {
 
     pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
-            "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at
+            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at
              FROM issues WHERE 1 = 1",
         );
         let mut params = Vec::new();
 
         if !query.include_archived {
             sql.push_str(" AND is_archived = 0");
+        }
+        if query.archived_only {
+            sql.push_str(" AND is_archived = 1");
         }
         if query.unsynced_only {
             sql.push_str(" AND sync_state != 'synced'");
@@ -45,8 +48,10 @@ impl Store {
             .as_ref()
             .filter(|value| !value.trim().is_empty())
         {
-            sql.push_str(" AND (identifier LIKE ? OR title LIKE ? OR description LIKE ?)");
+            sql.push_str(" AND (identifier LIKE ? OR title LIKE ? OR description LIKE ? OR COALESCE(project, '') LIKE ? OR labels_json LIKE ?)");
             let pattern = format!("%{}%", search.trim());
+            params.push(pattern.clone());
+            params.push(pattern.clone());
             params.push(pattern.clone());
             params.push(pattern.clone());
             params.push(pattern);
@@ -62,7 +67,7 @@ impl Store {
     pub fn get_issue(&self, local_id: i64) -> Result<Option<Issue>> {
         self.conn
             .query_row(
-                "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at
+                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at
                  FROM issues WHERE local_id = ?1",
                 [local_id],
                 map_issue_row,
@@ -74,11 +79,13 @@ impl Store {
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, 0, 'pending_create', ?6)",
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at)
+             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'pending_create', ?8)",
             params![
                 draft.title,
                 draft.description,
+                draft.project,
+                encode_labels(&draft.labels)?,
                 encode_status(&draft.status),
                 encode_priority(&draft.priority),
                 draft.assignee,
@@ -113,16 +120,20 @@ impl Store {
             "UPDATE issues
              SET title = ?1,
                  description = ?2,
-                 status = ?3,
-                 priority = ?4,
-                 assignee = ?5,
-                 is_archived = ?6,
-                 sync_state = ?7,
-                 updated_at = ?8
-             WHERE local_id = ?9",
+                 project = ?3,
+                 labels_json = ?4,
+                 status = ?5,
+                 priority = ?6,
+                 assignee = ?7,
+                 is_archived = ?8,
+                 sync_state = ?9,
+                 updated_at = ?10
+             WHERE local_id = ?11",
             params![
                 patch.title.as_deref().unwrap_or(&current.title),
                 patch.description.as_deref().unwrap_or(&current.description),
+                patch.project.clone().unwrap_or(current.project.clone()),
+                encode_labels(patch.labels.as_ref().unwrap_or(&current.labels),)?,
                 encode_status(patch.status.as_ref().unwrap_or(&current.status)),
                 encode_priority(patch.priority.as_ref().unwrap_or(&current.priority)),
                 patch.assignee.clone().unwrap_or(current.assignee.clone()),
@@ -282,6 +293,8 @@ impl Store {
                 identifier TEXT NOT NULL,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
+                project TEXT,
+                labels_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 assignee TEXT,
@@ -298,16 +311,26 @@ impl Store {
                 last_error TEXT
             );",
         )?;
-        let has_is_archived = self
+        let columns = self
             .conn
             .prepare("PRAGMA table_info(issues)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .any(|column| column == "is_archived");
-        if !has_is_archived {
+            .collect::<Vec<_>>();
+        if !columns.iter().any(|column| column == "is_archived") {
             self.conn.execute(
                 "ALTER TABLE issues ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "project") {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN project TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "labels_json") {
+            self.conn.execute(
+                "ALTER TABLE issues ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'",
                 [],
             )?;
         }
@@ -324,10 +347,10 @@ impl Store {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at)
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at)
              VALUES
-             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'in_progress', 'high', 'you', 0, 'synced', ?1),
-             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'todo', 'medium', NULL, 0, 'pending_create', ?1)",
+             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'Core', '[\"offline\",\"ux\"]', 'in_progress', 'high', 'you', 0, 'synced', ?1),
+             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'Personal', '[\"draft\"]', 'todo', 'medium', NULL, 0, 'pending_create', ?1)",
             [now],
         )?;
         self.enqueue(QueuedMutationKind::CreateIssue { issue_local_id: 2 })?;
@@ -483,6 +506,54 @@ mod tests {
         assert!(all_view[0].is_archived);
         Ok(())
     }
+
+    #[test]
+    fn archived_only_query_returns_only_archived_items() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let active = store.create_issue(&IssueDraft::new("Active", "Visible by default"))?;
+        let archived = store.create_issue(&IssueDraft::new("Archived", "Hidden by default"))?;
+        store.archive_issue(archived.local_id, true)?;
+
+        let archived_only = store.list_issues(&IssueQuery {
+            include_archived: true,
+            archived_only: true,
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(archived_only.len(), 1);
+        assert_eq!(archived_only[0].local_id, archived.local_id);
+        assert_ne!(archived_only[0].local_id, active.local_id);
+        Ok(())
+    }
+
+    #[test]
+    fn project_and_labels_round_trip_and_search() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let mut draft = IssueDraft::new("Plan local project", "Track work offline");
+        draft.project = Some("Ops".into());
+        draft.labels = vec!["cli".into(), "planning".into()];
+
+        let created = store.create_issue(&draft)?;
+        assert_eq!(created.project.as_deref(), Some("Ops"));
+        assert_eq!(
+            created.labels,
+            vec!["cli".to_string(), "planning".to_string()]
+        );
+
+        let by_project = store.list_issues(&IssueQuery {
+            search: Some("Ops".into()),
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(by_project.len(), 1);
+        assert_eq!(by_project[0].local_id, created.local_id);
+
+        let by_label = store.list_issues(&IssueQuery {
+            search: Some("planning".into()),
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(by_label.len(), 1);
+        assert_eq!(by_label[0].local_id, created.local_id);
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -492,13 +563,23 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         identifier: row.get(2)?,
         title: row.get(3)?,
         description: row.get(4)?,
-        status: decode_status(&row.get::<_, String>(5)?)?,
-        priority: decode_priority(&row.get::<_, String>(6)?)?,
-        assignee: row.get(7)?,
-        is_archived: row.get::<_, i64>(8)? != 0,
-        sync_state: decode_sync_state(&row.get::<_, String>(9)?)?,
-        updated_at: parse_dt(row.get::<_, String>(10)?).map_err(to_sql_conversion_error)?,
+        project: row.get(5)?,
+        labels: decode_labels(&row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
+        status: decode_status(&row.get::<_, String>(7)?)?,
+        priority: decode_priority(&row.get::<_, String>(8)?)?,
+        assignee: row.get(9)?,
+        is_archived: row.get::<_, i64>(10)? != 0,
+        sync_state: decode_sync_state(&row.get::<_, String>(11)?)?,
+        updated_at: parse_dt(row.get::<_, String>(12)?).map_err(to_sql_conversion_error)?,
     })
+}
+
+fn encode_labels(labels: &[String]) -> Result<String> {
+    Ok(serde_json::to_string(labels)?)
+}
+
+fn decode_labels(value: &str) -> std::result::Result<Vec<String>, serde_json::Error> {
+    serde_json::from_str(value)
 }
 
 fn parse_dt(value: String) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {

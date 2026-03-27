@@ -30,11 +30,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_sidebar(frame, app, body[2]);
     render_status_bar(frame, app, chunks[1]);
     render_editor(frame, app);
+    render_help(frame, app);
 }
 
 fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let items: Vec<ListItem<'_>> = if app.issues.is_empty() {
-        vec![ListItem::new("No issues match the current filter")]
+        vec![ListItem::new(empty_state_copy(app))]
     } else {
         app.issues.iter().map(issue_list_item).collect()
     };
@@ -44,11 +45,7 @@ fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
             Block::default()
                 .title(format!(
                     " Issues ({}) ",
-                    if app.query.include_archived {
-                        "active + archived"
-                    } else {
-                        "active"
-                    }
+                    app.query_summary()
                 ))
                 .borders(Borders::ALL),
         )
@@ -111,6 +108,18 @@ fn render_issue_detail(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
             Line::from(format!("Status: {}", issue.status.label())),
             Line::from(format!("Priority: {}", issue.priority.label())),
             Line::from(format!(
+                "Project: {}",
+                issue.project.as_deref().unwrap_or("none")
+            )),
+            Line::from(format!(
+                "Labels: {}",
+                if issue.labels.is_empty() {
+                    "none".to_string()
+                } else {
+                    issue.labels.join(", ")
+                }
+            )),
+            Line::from(format!(
                 "Assignee: {}",
                 issue.assignee.as_deref().unwrap_or("unassigned")
             )),
@@ -159,9 +168,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Line::from("s / p          cycle status / priority"),
         Line::from("a              archive or restore"),
         Line::from("v              show archived"),
+        Line::from("1 / 2 / 3      active / unsynced / archived"),
         Line::from("/              search"),
         Line::from("u              clear search"),
         Line::from("f              toggle unsynced"),
+        Line::from("?              help overlay"),
         Line::from("y              sync now"),
         Line::from("r              retry errors"),
         Line::from("q              quit"),
@@ -223,6 +234,43 @@ fn render_editor(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
+fn render_help(frame: &mut Frame, app: &App) {
+    if !app.show_help {
+        return;
+    }
+
+    let popup = centered_rect(72, 62, frame.area());
+    frame.render_widget(Clear, popup);
+    let body = vec![
+        Line::from("Basic loop"),
+        Line::from("1. Move with j/k or arrow keys."),
+        Line::from("2. Press n to create or e to edit."),
+        Line::from("3. Use Tab to move fields, Enter to save, Esc to cancel."),
+        Line::from("4. Organize with project, labels, assignee, status, and priority."),
+        Line::from("5. Search with / and switch saved views with 1, 2, and 3."),
+        Line::from(""),
+        Line::from("Views"),
+        Line::from("1 active issues"),
+        Line::from("2 unsynced issues"),
+        Line::from("3 archived issues"),
+        Line::from("v show or hide archived alongside active issues"),
+        Line::from("f quick unsynced toggle"),
+        Line::from(""),
+        Line::from("Issue actions"),
+        Line::from("s cycle status"),
+        Line::from("p cycle priority"),
+        Line::from("a archive or restore selected issue"),
+        Line::from("y attempt sync"),
+        Line::from("r retry failed sync states"),
+        Line::from(""),
+        Line::from("Press ? or Esc to close this help."),
+    ];
+    let widget = Paragraph::new(body)
+        .block(Block::default().title(" Help ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, popup);
+}
+
 fn issue_editor_lines(editor: &crate::app::EditorState, intro: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(intro.to_string()),
@@ -235,6 +283,13 @@ fn issue_editor_lines(editor: &crate::app::EditorState, intro: &str) -> Vec<Line
             EditorFocus::Description,
             &editor.description,
         ),
+        field_line(
+            "project",
+            editor.focus,
+            EditorFocus::Project,
+            &editor.project,
+        ),
+        field_line("labels", editor.focus, EditorFocus::Labels, &editor.labels),
         field_line(
             "assignee",
             editor.focus,
@@ -266,6 +321,8 @@ fn matches_focus(current: EditorFocus, target: EditorFocus) -> bool {
         (current, target),
         (EditorFocus::Title, EditorFocus::Title)
             | (EditorFocus::Description, EditorFocus::Description)
+            | (EditorFocus::Project, EditorFocus::Project)
+            | (EditorFocus::Labels, EditorFocus::Labels)
             | (EditorFocus::Assignee, EditorFocus::Assignee)
     )
 }
@@ -292,6 +349,16 @@ fn centered_rect(
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+fn empty_state_copy(app: &App) -> &'static str {
+    if app.query.archived_only {
+        "No archived issues in this view. Press n to create one or 1 to go back to active work."
+    } else if app.query.unsynced_only {
+        "No unsynced issues right now. Press n to create a local issue or 1 to browse all active work."
+    } else {
+        "No active issues yet. Press n to create your first local issue."
+    }
 }
 
 fn status_color(issue: &Issue) -> Color {
