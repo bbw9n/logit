@@ -8,7 +8,7 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -37,18 +37,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
                 continue;
             }
 
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
-                KeyCode::Char('n') => app.create_issue()?,
-                KeyCode::Char('s') => app.cycle_status()?,
-                KeyCode::Char('e') => app.touch_title()?,
-                KeyCode::Char('d') => app.delete_current_issue()?,
-                KeyCode::Char('y') => app.sync_now()?,
-                KeyCode::Char('r') => app.retry_failed_sync()?,
-                KeyCode::Char('/') => app.toggle_filter(),
-                _ => {}
+            if app.handle_key(key)? {
+                break;
             }
         }
     }

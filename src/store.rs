@@ -25,11 +25,14 @@ impl Store {
 
     pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
-            "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at
+            "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at
              FROM issues WHERE 1 = 1",
         );
         let mut params = Vec::new();
 
+        if !query.include_archived {
+            sql.push_str(" AND is_archived = 0");
+        }
         if query.unsynced_only {
             sql.push_str(" AND sync_state != 'synced'");
         }
@@ -59,7 +62,7 @@ impl Store {
     pub fn get_issue(&self, local_id: i64) -> Result<Option<Issue>> {
         self.conn
             .query_row(
-                "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at
+                "SELECT local_id, remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at
                  FROM issues WHERE local_id = ?1",
                 [local_id],
                 map_issue_row,
@@ -71,8 +74,8 @@ impl Store {
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, 'pending_create', ?6)",
+            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at)
+             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, 0, 'pending_create', ?6)",
             params![
                 draft.title,
                 draft.description,
@@ -113,15 +116,17 @@ impl Store {
                  status = ?3,
                  priority = ?4,
                  assignee = ?5,
-                 sync_state = ?6,
-                 updated_at = ?7
-             WHERE local_id = ?8",
+                 is_archived = ?6,
+                 sync_state = ?7,
+                 updated_at = ?8
+             WHERE local_id = ?9",
             params![
                 patch.title.as_deref().unwrap_or(&current.title),
                 patch.description.as_deref().unwrap_or(&current.description),
                 encode_status(patch.status.as_ref().unwrap_or(&current.status)),
                 encode_priority(patch.priority.as_ref().unwrap_or(&current.priority)),
                 patch.assignee.clone().unwrap_or(current.assignee.clone()),
+                patch.is_archived.unwrap_or(current.is_archived),
                 encode_sync_state(&next_sync_state),
                 Utc::now().to_rfc3339(),
                 local_id,
@@ -176,6 +181,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_issue(&self, local_id: i64) -> Result<bool> {
         for mutation in self.list_pending_mutations()? {
             let matches_issue = match mutation.kind {
@@ -194,6 +200,12 @@ impl Store {
             .conn
             .execute("DELETE FROM issues WHERE local_id = ?1", [local_id])?;
         Ok(deleted > 0)
+    }
+
+    pub fn archive_issue(&self, local_id: i64, archived: bool) -> Result<Issue> {
+        let mut patch = IssuePatch::empty();
+        patch.is_archived = Some(archived);
+        self.update_issue(local_id, &patch)
     }
 
     pub fn mark_issue_synced(
@@ -273,6 +285,7 @@ impl Store {
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 assignee TEXT,
+                is_archived INTEGER NOT NULL DEFAULT 0,
                 sync_state TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -285,6 +298,19 @@ impl Store {
                 last_error TEXT
             );",
         )?;
+        let has_is_archived = self
+            .conn
+            .prepare("PRAGMA table_info(issues)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .any(|column| column == "is_archived");
+        if !has_is_archived {
+            self.conn.execute(
+                "ALTER TABLE issues ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -298,10 +324,10 @@ impl Store {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at)
+            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, is_archived, sync_state, updated_at)
              VALUES
-             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'in_progress', 'high', 'you', 'synced', ?1),
-             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'todo', 'medium', NULL, 'pending_create', ?1)",
+             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'in_progress', 'high', 'you', 0, 'synced', ?1),
+             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'todo', 'medium', NULL, 0, 'pending_create', ?1)",
             [now],
         )?;
         self.enqueue(QueuedMutationKind::CreateIssue { issue_local_id: 2 })?;
@@ -439,6 +465,24 @@ mod tests {
         assert_eq!(synced_issue.sync_state, SyncState::PendingUpdate);
         Ok(())
     }
+
+    #[test]
+    fn archived_issues_are_hidden_until_requested() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let issue = store.create_issue(&IssueDraft::new("Archive me", "Local archive flow"))?;
+        store.archive_issue(issue.local_id, true)?;
+
+        let default_view = store.list_issues(&IssueQuery::default())?;
+        assert!(default_view.is_empty());
+
+        let all_view = store.list_issues(&IssueQuery {
+            include_archived: true,
+            ..IssueQuery::default()
+        })?;
+        assert_eq!(all_view.len(), 1);
+        assert!(all_view[0].is_archived);
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -451,8 +495,9 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         status: decode_status(&row.get::<_, String>(5)?)?,
         priority: decode_priority(&row.get::<_, String>(6)?)?,
         assignee: row.get(7)?,
-        sync_state: decode_sync_state(&row.get::<_, String>(8)?)?,
-        updated_at: parse_dt(row.get::<_, String>(9)?).map_err(to_sql_conversion_error)?,
+        is_archived: row.get::<_, i64>(8)? != 0,
+        sync_state: decode_sync_state(&row.get::<_, String>(9)?)?,
+        updated_at: parse_dt(row.get::<_, String>(10)?).map_err(to_sql_conversion_error)?,
     })
 }
 

@@ -66,6 +66,16 @@ impl Priority {
             Self::Urgent => "urgent",
         }
     }
+
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::None => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Urgent,
+            Self::Urgent => Self::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +88,7 @@ pub struct Issue {
     pub status: IssueStatus,
     pub priority: Priority,
     pub assignee: Option<String>,
+    pub is_archived: bool,
     pub sync_state: SyncState,
     pub updated_at: DateTime<Utc>,
 }
@@ -110,6 +121,7 @@ pub struct IssuePatch {
     pub status: Option<IssueStatus>,
     pub priority: Option<Priority>,
     pub assignee: Option<Option<String>>,
+    pub is_archived: Option<bool>,
 }
 
 impl IssuePatch {
@@ -120,6 +132,7 @@ impl IssuePatch {
             status: None,
             priority: None,
             assignee: None,
+            is_archived: None,
         }
     }
 }
@@ -127,6 +140,7 @@ impl IssuePatch {
 #[derive(Debug, Clone, Default)]
 pub struct IssueQuery {
     pub unsynced_only: bool,
+    pub include_archived: bool,
     pub status: Option<IssueStatus>,
     pub search: Option<String>,
 }

@@ -1,18 +1,64 @@
 use crate::{
     config::WorkspaceConfig,
-    domain::{Issue, IssueDraft, IssuePatch, IssueQuery, SyncState},
+    domain::{Issue, IssueDraft, IssuePatch, IssueQuery, Priority, SyncState},
     store::Store,
     sync::{LinearSyncService, SyncService},
 };
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+#[derive(Debug, Clone, Copy)]
+pub enum EditorFocus {
+    Title,
+    Description,
+    Assignee,
+}
+
+impl EditorFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Title => Self::Description,
+            Self::Description => Self::Assignee,
+            Self::Assignee => Self::Title,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Title => Self::Assignee,
+            Self::Description => Self::Title,
+            Self::Assignee => Self::Description,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum EditorMode {
+    Create,
+    Edit { local_id: i64 },
+    Search,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub mode: EditorMode,
+    pub focus: EditorFocus,
+    pub title: String,
+    pub description: String,
+    pub assignee: String,
+    pub status: crate::domain::IssueStatus,
+    pub priority: Priority,
+    pub search: String,
+}
 
 pub struct App {
     pub config: WorkspaceConfig,
     pub issues: Vec<Issue>,
     pub selected: usize,
-    pub unsynced_only: bool,
+    pub query: IssueQuery,
     pub status_message: String,
     pub queued_mutation_count: usize,
+    pub editor: Option<EditorState>,
     store: Store,
     sync_service: LinearSyncService,
 }
@@ -26,9 +72,10 @@ impl App {
             config,
             issues: Vec::new(),
             selected: 0,
-            unsynced_only: false,
+            query: IssueQuery::default(),
             status_message: String::from("Offline-first issue tracking ready"),
             queued_mutation_count: 0,
+            editor: None,
             store,
             sync_service,
         };
@@ -38,6 +85,32 @@ impl App {
 
     pub fn current_issue(&self) -> Option<&Issue> {
         self.issues.get(self.selected)
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.editor.is_some() {
+            return self.handle_editor_key(key);
+        }
+
+        match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
+            KeyCode::Char('n') => self.begin_create_editor(),
+            KeyCode::Char('e') => self.begin_edit_editor(),
+            KeyCode::Char('s') => self.cycle_status()?,
+            KeyCode::Char('p') => self.cycle_priority()?,
+            KeyCode::Char('a') => self.toggle_archive_current_issue()?,
+            KeyCode::Char('v') => self.toggle_archived_visibility(),
+            KeyCode::Char('y') => self.sync_now()?,
+            KeyCode::Char('r') => self.retry_failed_sync()?,
+            KeyCode::Char('/') => self.begin_search_editor(),
+            KeyCode::Char('u') => self.clear_search(),
+            KeyCode::Char('f') => self.toggle_unsynced_filter(),
+            _ => {}
+        }
+
+        Ok(false)
     }
 
     pub fn select_next(&mut self) {
@@ -56,23 +129,60 @@ impl App {
         }
     }
 
-    pub fn toggle_filter(&mut self) {
-        self.unsynced_only = !self.unsynced_only;
+    pub fn toggle_unsynced_filter(&mut self) {
+        self.query.unsynced_only = !self.query.unsynced_only;
         if let Err(error) = self.reload() {
             self.status_message = format!("Failed to reload issues: {error:#}");
         }
     }
 
-    pub fn create_issue(&mut self) -> Result<()> {
-        let count = self.queued_mutation_count + 1;
-        let issue = self.store.create_issue(&IssueDraft::new(
-            format!("Local draft issue #{count}"),
-            "Created from the TUI while offline. Press y to attempt sync once LINEAR_API_KEY is available.",
-        ))?;
-        self.reload()?;
-        self.select_issue(issue.local_id);
-        self.status_message = format!("Created {} and queued it for sync", issue.identifier);
-        Ok(())
+    pub fn begin_create_editor(&mut self) {
+        self.editor = Some(EditorState {
+            mode: EditorMode::Create,
+            focus: EditorFocus::Title,
+            title: String::new(),
+            description: String::new(),
+            assignee: String::new(),
+            status: crate::domain::IssueStatus::Todo,
+            priority: Priority::Medium,
+            search: String::new(),
+        });
+        self.status_message =
+            "Creating a local issue. Tab moves fields, s/p cycle status and priority.".into();
+    }
+
+    pub fn begin_edit_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected to edit".into();
+            return;
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::Edit {
+                local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: issue.title.clone(),
+            description: issue.description.clone(),
+            assignee: issue.assignee.clone().unwrap_or_default(),
+            status: issue.status.clone(),
+            priority: issue.priority.clone(),
+            search: self.query.search.clone().unwrap_or_default(),
+        });
+        self.status_message = format!("Editing {}", issue.identifier);
+    }
+
+    pub fn begin_search_editor(&mut self) {
+        self.editor = Some(EditorState {
+            mode: EditorMode::Search,
+            focus: EditorFocus::Title,
+            title: String::new(),
+            description: String::new(),
+            assignee: String::new(),
+            status: crate::domain::IssueStatus::Todo,
+            priority: Priority::Medium,
+            search: self.query.search.clone().unwrap_or_default(),
+        });
+        self.status_message = "Search issues by title, identifier, or description".into();
     }
 
     pub fn cycle_status(&mut self) -> Result<()> {
@@ -92,16 +202,20 @@ impl App {
         Ok(())
     }
 
-    pub fn touch_title(&mut self) -> Result<()> {
+    pub fn cycle_priority(&mut self) -> Result<()> {
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
         };
         let mut patch = IssuePatch::empty();
-        patch.title = Some(format!("{} [edited]", issue.title));
+        patch.priority = Some(issue.priority.cycle());
         let updated = self.store.update_issue(issue.local_id, &patch)?;
         self.reload()?;
         self.select_issue(updated.local_id);
-        self.status_message = format!("Queued local edit for {}", updated.identifier);
+        self.status_message = format!(
+            "Updated {} priority to {}",
+            updated.identifier,
+            updated.priority.label()
+        );
         Ok(())
     }
 
@@ -134,31 +248,214 @@ impl App {
         Ok(())
     }
 
-    pub fn delete_current_issue(&mut self) -> Result<()> {
+    pub fn toggle_archive_current_issue(&mut self) -> Result<()> {
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
         };
-        let deleted = self.store.delete_issue(issue.local_id)?;
+        let updated = self
+            .store
+            .archive_issue(issue.local_id, !issue.is_archived)?;
         self.reload()?;
-        self.status_message = if deleted {
-            format!("Deleted {}", issue.identifier)
+        self.status_message = if updated.is_archived {
+            format!("Archived {}", updated.identifier)
         } else {
-            format!("Could not delete {}", issue.identifier)
+            format!("Restored {}", updated.identifier)
         };
         Ok(())
     }
 
+    pub fn toggle_archived_visibility(&mut self) {
+        self.query.include_archived = !self.query.include_archived;
+        if let Err(error) = self.reload() {
+            self.status_message = format!("Failed to reload issues: {error:#}");
+        } else if self.query.include_archived {
+            self.status_message = "Showing archived issues".into();
+        } else {
+            self.status_message = "Hiding archived issues".into();
+        }
+    }
+
+    pub fn clear_search(&mut self) {
+        self.query.search = None;
+        if let Err(error) = self.reload() {
+            self.status_message = format!("Failed to clear search: {error:#}");
+        } else {
+            self.status_message = "Cleared search filter".into();
+        }
+    }
+
+    pub fn query_summary(&self) -> String {
+        let search = self.query.search.as_deref().unwrap_or("none");
+        format!(
+            "archived: {} | unsynced: {} | search: {}",
+            if self.query.include_archived {
+                "shown"
+            } else {
+                "hidden"
+            },
+            if self.query.unsynced_only {
+                "only"
+            } else {
+                "all"
+            },
+            search
+        )
+    }
+
     fn reload(&mut self) -> Result<()> {
-        self.issues = self.store.list_issues(&IssueQuery {
-            unsynced_only: self.unsynced_only,
-            ..IssueQuery::default()
-        })?;
+        self.issues = self.store.list_issues(&self.query)?;
         self.queued_mutation_count = self.store.list_pending_mutations()?.len();
         if self.issues.is_empty() {
             self.selected = 0;
         } else {
             self.selected = self.selected.min(self.issues.len() - 1);
         }
+        Ok(())
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor = None;
+                self.status_message = "Cancelled input".into();
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                self.submit_editor()?;
+                return Ok(false);
+            }
+            KeyCode::Tab => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if !matches!(editor.mode, EditorMode::Search) {
+                        editor.focus = editor.focus.next();
+                    }
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if !matches!(editor.mode, EditorMode::Search) {
+                        editor.focus = editor.focus.previous();
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(editor) = self.editor.as_mut() {
+                    match editor.mode {
+                        EditorMode::Search => {
+                            editor.search.pop();
+                        }
+                        _ => match editor.focus {
+                            EditorFocus::Title => {
+                                editor.title.pop();
+                            }
+                            EditorFocus::Description => {
+                                editor.description.pop();
+                            }
+                            EditorFocus::Assignee => {
+                                editor.assignee.pop();
+                            }
+                        },
+                    }
+                }
+            }
+            KeyCode::Char('s') if key.modifiers.is_empty() => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if !matches!(editor.mode, EditorMode::Search) {
+                        editor.status = editor.status.cycle();
+                    }
+                }
+            }
+            KeyCode::Char('p') if key.modifiers.is_empty() => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if !matches!(editor.mode, EditorMode::Search) {
+                        editor.priority = editor.priority.cycle();
+                    }
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if let Some(editor) = self.editor.as_mut() {
+                    match editor.mode {
+                        EditorMode::Search => editor.search.push(ch),
+                        _ => match editor.focus {
+                            EditorFocus::Title => editor.title.push(ch),
+                            EditorFocus::Description => editor.description.push(ch),
+                            EditorFocus::Assignee => editor.assignee.push(ch),
+                        },
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn submit_editor(&mut self) -> Result<()> {
+        let Some(editor) = self.editor.clone() else {
+            return Ok(());
+        };
+
+        match editor.mode {
+            EditorMode::Search => {
+                let search = editor.search.trim().to_string();
+                self.query.search = if search.is_empty() {
+                    None
+                } else {
+                    Some(search)
+                };
+                self.reload()?;
+                self.status_message = if self.query.search.is_some() {
+                    "Applied search filter".into()
+                } else {
+                    "Cleared search filter".into()
+                };
+            }
+            EditorMode::Create => {
+                let title = if editor.title.trim().is_empty() {
+                    format!("Local draft issue #{}", self.queued_mutation_count + 1)
+                } else {
+                    editor.title.trim().to_string()
+                };
+                let description = if editor.description.trim().is_empty() {
+                    "Local issue created from the TUI.".to_string()
+                } else {
+                    editor.description.trim().to_string()
+                };
+                let mut draft = IssueDraft::new(title, description);
+                draft.status = editor.status;
+                draft.priority = editor.priority;
+                draft.assignee = empty_to_none(&editor.assignee);
+                let issue = self.store.create_issue(&draft)?;
+                self.reload()?;
+                self.select_issue(issue.local_id);
+                self.status_message = format!("Created {}", issue.identifier);
+            }
+            EditorMode::Edit { local_id } => {
+                let Some(existing) = self.store.get_issue(local_id)? else {
+                    self.editor = None;
+                    self.status_message = "Selected issue no longer exists".into();
+                    return Ok(());
+                };
+                let mut patch = IssuePatch::empty();
+                patch.title = Some(if editor.title.trim().is_empty() {
+                    existing.title
+                } else {
+                    editor.title.trim().to_string()
+                });
+                patch.description = Some(editor.description.trim().to_string());
+                patch.assignee = Some(empty_to_none(&editor.assignee));
+                patch.status = Some(editor.status);
+                patch.priority = Some(editor.priority);
+                let issue = self.store.update_issue(local_id, &patch)?;
+                self.reload()?;
+                self.select_issue(issue.local_id);
+                self.status_message = format!("Saved local edits for {}", issue.identifier);
+            }
+        }
+
+        self.editor = None;
         Ok(())
     }
 
@@ -200,5 +497,14 @@ impl App {
             "queue: {} | pending: {} | errors: {}",
             self.queued_mutation_count, pending, errors
         )
+    }
+}
+
+fn empty_to_none(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
