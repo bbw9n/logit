@@ -1,19 +1,21 @@
 # logit
 
-`logit` is a Rust TUI for local-first issue tracking inspired by Linear.
+`logit` is a Rust TUI for local-first work tracking inspired by Linear.
 
-The current version is optimized around offline workflows first: browse issues, create and edit them locally, organize work with projects and labels, search, archive, and switch between saved views in the terminal. The Linear sync boundary exists in code, but real remote GraphQL integration is not finished yet.
+The current version is optimized around offline terminal workflows first: work through an inbox, track richer human/agent-facing issue states, capture scratch notes before they become formal issues, organize work with projects and labels, search, archive, and switch between saved views in the terminal. The Linear sync boundary exists in code, but real remote GraphQL integration is not finished yet.
 
 ## Current Status
 
 What works today:
 
 - Local issue creation and editing
+- Terminal-native issue states like `ready for agent`, `agent running`, `needs review`, and `blocked`
+- Scratch capture and promotion into full issues
 - SQLite-backed persistence
 - Search across identifier, title, description, project, and labels
 - Project and label organization
 - Archive and restore flows
-- Saved views for active, unsynced, and archived work
+- Saved views for inbox, running, review, waiting, done, and scratch work
 - Offline mutation queue and tested sync boundary behavior
 - GitHub Actions CI for format, check, and test
 
@@ -56,17 +58,26 @@ cargo test --locked
 
 - `n`: create a new issue
 - `e`: edit the selected issue
+- `x`: capture a scratch item
+- `i`: promote the selected scratch item into a full issue
 - `Enter`: save the current modal
 - `Tab` / `Shift+Tab`: move between modal fields
 - `s`: cycle issue status
 - `p`: cycle issue priority
+- `h`: send the selected issue to an agent
+- `m`: mark the selected issue as needing human input
+- `w`: mark the selected issue as needing review
+- `b`: mark the selected issue as blocked
 - `a`: archive or restore the selected issue
 
 ### Views And Search
 
-- `1`: active issues view
-- `2`: unsynced issues view
-- `3`: archived issues view
+- `1`: inbox view
+- `2`: running view
+- `3`: review view
+- `4`: waiting view
+- `5`: done view
+- `6`: scratch view
 - `v`: toggle archived visibility in the current view
 - `/`: open search
 - `u`: clear search
@@ -124,7 +135,7 @@ High-level structure:
 - [src/app.rs](src/app.rs): app state and keyboard workflows
 - [src/ui.rs](src/ui.rs): layout, panes, modals, help overlay
 - [src/store.rs](src/store.rs): SQLite CRUD, query, archive, queue logic
-- [src/domain.rs](src/domain.rs): issue and query types
+- [src/domain.rs](src/domain.rs): issue, scratch, queue, and query types
 - [src/sync.rs](src/sync.rs): sync boundary and placeholder service
 
 ## Tests
@@ -135,6 +146,8 @@ The current test suite covers:
 - Search and filtering
 - Archive visibility rules
 - Project and label persistence
+- Scratch capture and promotion
+- Inbox view filtering by terminal-native issue state
 - Mutation queue cleanup
 - Sync-state transitions
 - Placeholder sync success and failure paths
@@ -149,6 +162,6 @@ cargo test --locked
 
 Near-term directions:
 
-1. Improve local editor UX with richer text input and more obvious field affordances.
-2. Add stronger local planning workflows like notes, saved filters, and better sort/group options.
+1. Add richer local workflows like handoffs, run history, and evidence-based closure.
+2. Improve local editor UX with richer text input and more obvious field affordances.
 3. Replace the placeholder sync layer with real Linear GraphQL integration.

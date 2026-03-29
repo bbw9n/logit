@@ -1,7 +1,7 @@
 use crate::{
     app::{App, EditorFocus, EditorMode},
     config::ThemePreset,
-    domain::Issue,
+    domain::{Issue, ScratchItem, ScratchSource},
 };
 use ratatui::{
     Frame,
@@ -171,17 +171,31 @@ pub fn render(frame: &mut Frame, app: &App) {
         ])
         .split(chunks[0]);
 
-    render_issue_list(frame, app, body[0], palette);
-    render_issue_detail(frame, app, body[1], palette);
+    render_primary_list(frame, app, body[0], palette);
+    render_primary_detail(frame, app, body[1], palette);
     render_sidebar(frame, app, body[2], palette);
     render_status_bar(frame, app, chunks[1], palette);
     render_editor(frame, app, palette);
     render_help(frame, app, palette);
 }
 
-fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, palette: Palette) {
+fn render_primary_list(
+    frame: &mut Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    palette: Palette,
+) {
     let query_summary = app.query_summary();
-    let items: Vec<ListItem<'_>> = if app.issues.is_empty() {
+    let items: Vec<ListItem<'_>> = if app.is_scratch_view() {
+        if app.scratch_items.is_empty() {
+            vec![ListItem::new(empty_state_copy(app))]
+        } else {
+            app.scratch_items
+                .iter()
+                .map(|scratch| scratch_list_item(scratch, palette))
+                .collect()
+        }
+    } else if app.issues.is_empty() {
         vec![ListItem::new(empty_state_copy(app))]
     } else {
         app.issues
@@ -193,7 +207,7 @@ fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(styled_title("Issues", &query_summary, palette))
+                .title(styled_title(app.list_title(), &query_summary, palette))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(palette.border))
                 .style(Style::default().bg(palette.panel)),
@@ -207,7 +221,9 @@ fn render_issue_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, 
         .highlight_symbol("  ");
 
     let mut state = ListState::default();
-    if !app.issues.is_empty() {
+    if (app.is_scratch_view() && !app.scratch_items.is_empty())
+        || (!app.is_scratch_view() && !app.issues.is_empty())
+    {
         state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, area, &mut state);
@@ -248,13 +264,92 @@ fn issue_list_item(issue: &Issue, palette: Palette) -> ListItem<'_> {
     ])
 }
 
-fn render_issue_detail(
+fn scratch_list_item(scratch: &ScratchItem, palette: Palette) -> ListItem<'_> {
+    let title = scratch.body.lines().next().unwrap_or("(empty scratch)");
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled("◌ ", Style::default().fg(palette.accent)),
+            Span::styled(
+                format!("SCR-{:03}", scratch.id),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {title}")),
+        ]),
+        Line::from(vec![
+            badge(
+                scratch.source.label(),
+                palette.white,
+                badge_bg(source_color(&scratch.source, palette), palette),
+            ),
+            Span::raw(" "),
+            if let Some(issue_id) = scratch.promoted_issue_id {
+                Span::styled(
+                    format!(" promoted -> LOCAL-{issue_id} "),
+                    Style::default().fg(palette.muted),
+                )
+            } else {
+                Span::styled(" unpromoted ", Style::default().fg(palette.soft))
+            },
+        ]),
+    ])
+}
+
+fn render_primary_detail(
     frame: &mut Frame,
     app: &App,
     area: ratatui::layout::Rect,
     palette: Palette,
 ) {
-    let text = if let Some(issue) = app.current_issue() {
+    let text = if let Some(scratch) = app.current_scratch() {
+        let created = scratch
+            .created_at
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string();
+        Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("SCR-{:03}", scratch.id),
+                    Style::default().fg(palette.accent),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    scratch
+                        .body
+                        .lines()
+                        .next()
+                        .unwrap_or("(empty scratch)")
+                        .to_string(),
+                    Style::default()
+                        .fg(palette.white)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            meta_line("Source", scratch.source.label(), palette),
+            meta_line("Created", created, palette),
+            meta_line(
+                "Promoted",
+                scratch
+                    .promoted_issue_id
+                    .map(|id| format!("LOCAL-{id}"))
+                    .unwrap_or_else(|| "not yet".to_string()),
+                palette,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Scratch Body",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                scratch.body.clone(),
+                Style::default().fg(palette.soft),
+            )),
+        ])
+    } else if let Some(issue) = app.current_issue() {
         let labels = if issue.labels.is_empty() {
             "none".to_string()
         } else {
@@ -275,6 +370,20 @@ fn render_issue_detail(
             Line::from(""),
             meta_line("Status", issue.status.label(), palette),
             meta_line("Priority", issue.priority.label(), palette),
+            meta_line("Owner", issue.owner_type.label(), palette),
+            meta_line(
+                "Owner Name",
+                issue.owner_name.as_deref().unwrap_or("none"),
+                palette,
+            ),
+            meta_line(
+                "Attention",
+                issue
+                    .attention_reason
+                    .as_deref()
+                    .unwrap_or("no explicit handoff context"),
+                palette,
+            ),
             meta_line(
                 "Project",
                 issue.project.as_deref().unwrap_or("none"),
@@ -289,6 +398,11 @@ fn render_issue_detail(
             meta_line(
                 "Archived",
                 if issue.is_archived { "yes" } else { "no" },
+                palette,
+            ),
+            meta_line(
+                "Blocked Reason",
+                issue.blocked_reason.as_deref().unwrap_or("none"),
                 palette,
             ),
             meta_line("Sync", issue.sync_state.badge(), palette),
@@ -320,7 +434,15 @@ fn render_issue_detail(
     let paragraph = Paragraph::new(text)
         .block(
             Block::default()
-                .title(styled_title("Detail", "selected issue", palette))
+                .title(styled_title(
+                    "Detail",
+                    if app.is_scratch_view() {
+                        "selected scratch"
+                    } else {
+                        "selected issue"
+                    },
+                    palette,
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(palette.border))
                 .style(Style::default().bg(palette.panel_alt)),
@@ -362,13 +484,16 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("j/k or arrows", "move", palette),
         key_line("n", "new issue form", palette),
         key_line("e", "edit issue form", palette),
+        key_line("x", "capture scratch item", palette),
+        key_line("i", "promote scratch into issue", palette),
         key_line("s / p", "cycle status / priority", palette),
+        key_line("h / m / w / b", "agent / human / review / blocked", palette),
         key_line("a", "archive or restore", palette),
         key_line("v", "show archived", palette),
-        key_line("1 / 2 / 3", "active / unsynced / archived", palette),
+        key_line("1 / 2 / 3", "inbox / running / review", palette),
+        key_line("4 / 5 / 6", "waiting / done / scratch", palette),
         key_line("/", "search", palette),
         key_line("u", "clear search", palette),
-        key_line("f", "toggle unsynced", palette),
         key_line("?", "help overlay", palette),
         key_line("y", "sync now", palette),
         key_line("r", "retry errors", palette),
@@ -472,6 +597,7 @@ fn render_editor(frame: &mut Frame, app: &App, palette: Palette) {
                 ),
             ],
         ),
+        EditorMode::ScratchCapture => (" Scratch Capture ", scratch_editor_lines(editor, palette)),
         EditorMode::Create => (
             " New Issue ",
             issue_editor_lines(
@@ -518,21 +644,28 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("Basic loop"),
         Line::from("1. Move with j/k or arrow keys."),
         Line::from("2. Press n to create or e to edit."),
-        Line::from("3. Use Tab to move fields, Enter to save, Esc to cancel."),
-        Line::from("4. Organize with project, labels, assignee, status, and priority."),
-        Line::from("5. Search with / and switch saved views with 1, 2, and 3."),
+        Line::from("3. Press x to capture rough notes before they become full issues."),
+        Line::from("4. Use Tab to move fields, Enter to save, Esc to cancel."),
+        Line::from("5. Search with / and switch saved views with 1 through 6."),
         Line::from(""),
         Line::from("Views"),
-        Line::from("1 active issues"),
-        Line::from("2 unsynced issues"),
-        Line::from("3 archived issues"),
-        Line::from("v show or hide archived alongside active issues"),
-        Line::from("f quick unsynced toggle"),
+        Line::from("1 inbox"),
+        Line::from("2 running"),
+        Line::from("3 review"),
+        Line::from("4 waiting"),
+        Line::from("5 done"),
+        Line::from("6 scratch"),
         Line::from(""),
         Line::from("Issue actions"),
         Line::from("s cycle status"),
         Line::from("p cycle priority"),
+        Line::from("h send selected issue to an agent"),
+        Line::from("m mark selected issue as needing human input"),
+        Line::from("w mark selected issue as needing review"),
+        Line::from("b mark selected issue as blocked"),
         Line::from("a archive or restore selected issue"),
+        Line::from("x capture scratch note"),
+        Line::from("i promote selected scratch item"),
         Line::from("y attempt sync"),
         Line::from("r retry failed sync states"),
         Line::from(""),
@@ -627,6 +760,35 @@ fn issue_editor_lines(
     ]
 }
 
+fn scratch_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Capture rough terminal-native work before it becomes a structured issue.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Enter saves. Esc cancels. Ctrl+O cycles the source.",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "note",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            palette,
+        ),
+        Line::from(vec![
+            Span::styled("source ", Style::default().fg(palette.title)),
+            badge(
+                editor.scratch_source.label(),
+                palette.white,
+                badge_bg(source_color(&editor.scratch_source, palette), palette),
+            ),
+        ]),
+    ]
+}
+
 fn field_line(
     label: &str,
     current: EditorFocus,
@@ -695,20 +857,33 @@ fn centered_rect(
 }
 
 fn empty_state_copy(app: &App) -> &'static str {
-    if app.query.archived_only {
-        "No archived issues in this view. Press n to create one or 1 to go back to active work."
-    } else if app.query.unsynced_only {
-        "No unsynced issues right now. Press n to create a local issue or 1 to browse all active work."
+    if app.is_scratch_view() {
+        "No scratch items yet. Press x to capture a note you want to turn into tracked work later."
+    } else if app.saved_view == crate::app::SavedView::Done {
+        "No done issues here yet. Close a loop and it will appear in this reviewable history."
     } else {
-        "No active issues yet. Press n to create your first local issue."
+        "Nothing in this work queue yet. Press n to create an issue or x to capture a scratch note."
     }
 }
 
 fn status_color(issue: &Issue, palette: Palette) -> Color {
     match issue.status {
         crate::domain::IssueStatus::Todo => palette.todo,
-        crate::domain::IssueStatus::InProgress => palette.progress,
+        crate::domain::IssueStatus::ReadyForAgent => palette.accent,
+        crate::domain::IssueStatus::AgentRunning => palette.progress,
+        crate::domain::IssueStatus::NeedsHumanInput => palette.medium_priority,
+        crate::domain::IssueStatus::NeedsReview => palette.conflict,
+        crate::domain::IssueStatus::Blocked => palette.urgent_priority,
         crate::domain::IssueStatus::Done => palette.done,
+    }
+}
+
+fn source_color(source: &ScratchSource, palette: Palette) -> Color {
+    match source {
+        ScratchSource::Manual => palette.accent,
+        ScratchSource::Agent => palette.progress,
+        ScratchSource::RunFailure => palette.urgent_priority,
+        ScratchSource::Pasted => palette.todo,
     }
 }
 
@@ -784,7 +959,11 @@ fn meta_line(label: &str, value: impl Into<String>, palette: Palette) -> Line<'s
 fn status_color_for_label(label: &str, palette: Palette) -> Color {
     match label {
         "todo" => palette.todo,
-        "in progress" => palette.progress,
+        "ready for agent" => palette.accent,
+        "agent running" => palette.progress,
+        "needs human input" => palette.medium_priority,
+        "needs review" => palette.conflict,
+        "blocked" => palette.urgent_priority,
         "done" => palette.done,
         _ => palette.soft,
     }

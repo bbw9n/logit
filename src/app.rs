@@ -1,6 +1,9 @@
 use crate::{
     config::WorkspaceConfig,
-    domain::{Issue, IssueDraft, IssuePatch, IssueQuery, Priority, SyncState},
+    domain::{
+        Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority, ScratchItem,
+        ScratchSource, SyncState,
+    },
     store::Store,
     sync::{LinearSyncService, SyncService},
 };
@@ -43,6 +46,7 @@ pub enum EditorMode {
     Create,
     Edit { local_id: i64 },
     Search,
+    ScratchCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -54,16 +58,19 @@ pub struct EditorState {
     pub project: String,
     pub labels: String,
     pub assignee: String,
-    pub status: crate::domain::IssueStatus,
+    pub status: IssueStatus,
     pub priority: Priority,
     pub search: String,
+    pub scratch_source: ScratchSource,
 }
 
 pub struct App {
     pub config: WorkspaceConfig,
     pub issues: Vec<Issue>,
+    pub scratch_items: Vec<ScratchItem>,
     pub selected: usize,
     pub query: IssueQuery,
+    pub saved_view: SavedView,
     pub status_message: String,
     pub queued_mutation_count: usize,
     pub editor: Option<EditorState>,
@@ -80,8 +87,10 @@ impl App {
         let mut app = Self {
             config,
             issues: Vec::new(),
+            scratch_items: Vec::new(),
             selected: 0,
             query: IssueQuery::default(),
+            saved_view: SavedView::Inbox,
             status_message: String::from("Offline-first issue tracking ready"),
             queued_mutation_count: 0,
             editor: None,
@@ -94,7 +103,17 @@ impl App {
     }
 
     pub fn current_issue(&self) -> Option<&Issue> {
+        if self.saved_view == SavedView::Scratch {
+            return None;
+        }
         self.issues.get(self.selected)
+    }
+
+    pub fn current_scratch(&self) -> Option<&ScratchItem> {
+        if self.saved_view != SavedView::Scratch {
+            return None;
+        }
+        self.scratch_items.get(self.selected)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -112,13 +131,22 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
             KeyCode::Char('n') => self.begin_create_editor(),
             KeyCode::Char('e') => self.begin_edit_editor(),
+            KeyCode::Char('x') => self.begin_scratch_editor(),
+            KeyCode::Char('i') => self.promote_selected_scratch()?,
             KeyCode::Char('s') => self.cycle_status()?,
             KeyCode::Char('p') => self.cycle_priority()?,
             KeyCode::Char('a') => self.toggle_archive_current_issue()?,
+            KeyCode::Char('h') => self.send_current_issue_to_agent()?,
+            KeyCode::Char('m') => self.request_human_input()?,
+            KeyCode::Char('w') => self.request_review()?,
+            KeyCode::Char('b') => self.mark_current_issue_blocked()?,
             KeyCode::Char('v') => self.toggle_archived_visibility(),
-            KeyCode::Char('1') => self.set_saved_view(SavedView::Active),
-            KeyCode::Char('2') => self.set_saved_view(SavedView::Unsynced),
-            KeyCode::Char('3') => self.set_saved_view(SavedView::Archived),
+            KeyCode::Char('1') => self.set_saved_view(SavedView::Inbox),
+            KeyCode::Char('2') => self.set_saved_view(SavedView::Running),
+            KeyCode::Char('3') => self.set_saved_view(SavedView::Review),
+            KeyCode::Char('4') => self.set_saved_view(SavedView::Waiting),
+            KeyCode::Char('5') => self.set_saved_view(SavedView::Done),
+            KeyCode::Char('6') => self.set_saved_view(SavedView::Scratch),
             KeyCode::Char('?') => self.toggle_help(),
             KeyCode::Char('y') => self.sync_now()?,
             KeyCode::Char('r') => self.retry_failed_sync()?,
@@ -132,15 +160,16 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if self.issues.is_empty() {
+        let len = self.visible_len();
+        if len == 0 {
             self.selected = 0;
         } else {
-            self.selected = (self.selected + 1).min(self.issues.len() - 1);
+            self.selected = (self.selected + 1).min(len - 1);
         }
     }
 
     pub fn select_previous(&mut self) {
-        if self.issues.is_empty() {
+        if self.visible_len() == 0 {
             self.selected = 0;
         } else {
             self.selected = self.selected.saturating_sub(1);
@@ -172,9 +201,10 @@ impl App {
             project: String::new(),
             labels: String::new(),
             assignee: String::new(),
-            status: crate::domain::IssueStatus::Todo,
+            status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: String::new(),
+            scratch_source: ScratchSource::Manual,
         });
         self.status_message =
             "Creating a local issue. Tab moves fields, Ctrl+S/Ctrl+P cycle status and priority."
@@ -199,6 +229,7 @@ impl App {
             status: issue.status.clone(),
             priority: issue.priority.clone(),
             search: self.query.search.clone().unwrap_or_default(),
+            scratch_source: ScratchSource::Manual,
         });
         self.status_message = format!("Editing {}", issue.identifier);
     }
@@ -212,12 +243,32 @@ impl App {
             project: String::new(),
             labels: String::new(),
             assignee: String::new(),
-            status: crate::domain::IssueStatus::Todo,
+            status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: self.query.search.clone().unwrap_or_default(),
+            scratch_source: ScratchSource::Manual,
         });
         self.status_message =
             "Search issues by title, identifier, description, project, or labels".into();
+    }
+
+    pub fn begin_scratch_editor(&mut self) {
+        self.editor = Some(EditorState {
+            mode: EditorMode::ScratchCapture,
+            focus: EditorFocus::Title,
+            title: String::new(),
+            description: String::new(),
+            project: String::new(),
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Todo,
+            priority: Priority::Medium,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+        });
+        self.status_message =
+            "Capturing scratch work. Use the title field for a quick note and Ctrl+O to cycle the source."
+                .into();
     }
 
     pub fn cycle_status(&mut self) -> Result<()> {
@@ -284,6 +335,10 @@ impl App {
     }
 
     pub fn toggle_archive_current_issue(&mut self) -> Result<()> {
+        if self.saved_view == SavedView::Scratch {
+            self.status_message = "Scratch items are promoted, not archived".into();
+            return Ok(());
+        }
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
         };
@@ -297,6 +352,50 @@ impl App {
             format!("Restored {}", updated.identifier)
         };
         Ok(())
+    }
+
+    pub fn send_current_issue_to_agent(&mut self) -> Result<()> {
+        self.apply_handoff_transition(
+            IssueStatus::ReadyForAgent,
+            OwnerType::Agent,
+            Some("agent".into()),
+            Some("ready for agent pickup".into()),
+            None,
+            "Sent issue to agent",
+        )
+    }
+
+    pub fn request_human_input(&mut self) -> Result<()> {
+        self.apply_handoff_transition(
+            IssueStatus::NeedsHumanInput,
+            OwnerType::Human,
+            Some("human".into()),
+            Some("human decision needed".into()),
+            None,
+            "Marked issue as needing human input",
+        )
+    }
+
+    pub fn request_review(&mut self) -> Result<()> {
+        self.apply_handoff_transition(
+            IssueStatus::NeedsReview,
+            OwnerType::Human,
+            Some("reviewer".into()),
+            Some("review requested".into()),
+            None,
+            "Marked issue as needing review",
+        )
+    }
+
+    pub fn mark_current_issue_blocked(&mut self) -> Result<()> {
+        self.apply_handoff_transition(
+            IssueStatus::Blocked,
+            OwnerType::Unassigned,
+            None,
+            Some("blocked and waiting".into()),
+            Some("awaiting follow-up".into()),
+            "Marked issue as blocked",
+        )
     }
 
     pub fn toggle_archived_visibility(&mut self) {
@@ -335,7 +434,7 @@ impl App {
         let search = self.query.search.as_deref().unwrap_or("none");
         format!(
             "view: {} | archived: {} | search: {}",
-            self.saved_view_label(),
+            self.saved_view.label(),
             if self.query.archived_only {
                 "only"
             } else if self.query.include_archived {
@@ -348,12 +447,15 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
-        self.issues = self.store.list_issues(&self.query)?;
+        let issues = self.store.list_issues(&self.query)?;
+        self.issues = self.filter_issues_for_view(issues);
+        self.scratch_items = self.store.list_scratch_items()?;
         self.queued_mutation_count = self.store.list_pending_mutations()?.len();
-        if self.issues.is_empty() {
+        let len = self.visible_len();
+        if len == 0 {
             self.selected = 0;
         } else {
-            self.selected = self.selected.min(self.issues.len() - 1);
+            self.selected = self.selected.min(len - 1);
         }
         Ok(())
     }
@@ -420,6 +522,18 @@ impl App {
                 if let Some(editor) = self.editor.as_mut() {
                     if !matches!(editor.mode, EditorMode::Search) {
                         editor.priority = editor.priority.cycle();
+                    }
+                }
+            }
+            KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if matches!(editor.mode, EditorMode::ScratchCapture) {
+                        editor.scratch_source = match editor.scratch_source {
+                            ScratchSource::Manual => ScratchSource::Agent,
+                            ScratchSource::Agent => ScratchSource::RunFailure,
+                            ScratchSource::RunFailure => ScratchSource::Pasted,
+                            ScratchSource::Pasted => ScratchSource::Manual,
+                        };
                     }
                 }
             }
@@ -510,6 +624,20 @@ impl App {
                 self.select_issue(issue.local_id);
                 self.status_message = format!("Saved local edits for {}", issue.identifier);
             }
+            EditorMode::ScratchCapture => {
+                let body = if editor.title.trim().is_empty() {
+                    "Scratch note".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                let scratch = self
+                    .store
+                    .create_scratch_item(body, editor.scratch_source.clone())?;
+                self.reload()?;
+                self.saved_view = SavedView::Scratch;
+                self.select_scratch(scratch.id);
+                self.status_message = format!("Captured scratch item #{}", scratch.id);
+            }
         }
 
         self.editor = None;
@@ -517,38 +645,19 @@ impl App {
     }
 
     fn set_saved_view(&mut self, view: SavedView) {
-        match view {
-            SavedView::Active => {
-                self.query.unsynced_only = false;
-                self.query.include_archived = false;
-                self.query.archived_only = false;
-                self.status_message = "Switched to active issues".into();
-            }
-            SavedView::Unsynced => {
-                self.query.unsynced_only = true;
-                self.query.include_archived = false;
-                self.query.archived_only = false;
-                self.status_message = "Switched to unsynced issues".into();
-            }
-            SavedView::Archived => {
-                self.query.unsynced_only = false;
-                self.query.include_archived = true;
-                self.query.archived_only = true;
-                self.status_message = "Switched to archived issues".into();
-            }
+        self.saved_view = view;
+        self.query.unsynced_only = false;
+        self.query.include_archived = false;
+        self.query.archived_only = false;
+        if matches!(view, SavedView::Scratch) {
+            self.status_message = "Switched to scratch inbox".into();
+        } else if matches!(view, SavedView::Done) {
+            self.status_message = "Switched to done issues".into();
+        } else {
+            self.status_message = format!("Switched to {}", view.label());
         }
         if let Err(error) = self.reload() {
             self.status_message = format!("Failed to switch view: {error:#}");
-        }
-    }
-
-    fn saved_view_label(&self) -> &'static str {
-        if self.query.archived_only {
-            "archived"
-        } else if self.query.unsynced_only {
-            "unsynced"
-        } else {
-            "active"
         }
     }
 
@@ -557,6 +666,16 @@ impl App {
             .issues
             .iter()
             .position(|issue| issue.local_id == local_id)
+        {
+            self.selected = index;
+        }
+    }
+
+    fn select_scratch(&mut self, scratch_id: i64) {
+        if let Some(index) = self
+            .scratch_items
+            .iter()
+            .position(|scratch| scratch.id == scratch_id)
         {
             self.selected = index;
         }
@@ -587,17 +706,116 @@ impl App {
             .filter(|issue| issue.sync_state == SyncState::SyncError)
             .count();
         format!(
-            "queue: {} | pending: {} | errors: {}",
-            self.queued_mutation_count, pending, errors
+            "queue: {} | pending: {} | errors: {} | scratch: {}",
+            self.queued_mutation_count,
+            pending,
+            errors,
+            self.scratch_items
+                .iter()
+                .filter(|item| item.promoted_issue_id.is_none())
+                .count()
         )
+    }
+
+    pub fn is_scratch_view(&self) -> bool {
+        self.saved_view == SavedView::Scratch
+    }
+
+    pub fn list_title(&self) -> &'static str {
+        if self.is_scratch_view() {
+            "Scratch"
+        } else {
+            "Inbox"
+        }
+    }
+
+    fn visible_len(&self) -> usize {
+        if self.saved_view == SavedView::Scratch {
+            self.scratch_items.len()
+        } else {
+            self.issues.len()
+        }
+    }
+
+    fn filter_issues_for_view(&self, issues: Vec<Issue>) -> Vec<Issue> {
+        issues
+            .into_iter()
+            .filter(|issue| match self.saved_view {
+                SavedView::Inbox => issue.status.is_inbox_relevant(),
+                SavedView::Running => issue.status == IssueStatus::AgentRunning,
+                SavedView::Review => issue.status == IssueStatus::NeedsReview,
+                SavedView::Waiting => {
+                    matches!(
+                        issue.status,
+                        IssueStatus::Blocked | IssueStatus::NeedsHumanInput
+                    )
+                }
+                SavedView::Done => issue.status == IssueStatus::Done,
+                SavedView::Scratch => false,
+            })
+            .collect()
+    }
+
+    fn promote_selected_scratch(&mut self) -> Result<()> {
+        let Some(scratch) = self.current_scratch().cloned() else {
+            self.status_message = "No scratch item selected to promote".into();
+            return Ok(());
+        };
+        let issue = self.store.promote_scratch_to_issue(scratch.id)?;
+        self.saved_view = SavedView::Inbox;
+        self.reload()?;
+        self.select_issue(issue.local_id);
+        self.status_message = format!("Promoted scratch #{} into {}", scratch.id, issue.identifier);
+        Ok(())
+    }
+
+    fn apply_handoff_transition(
+        &mut self,
+        status: IssueStatus,
+        owner_type: OwnerType,
+        owner_name: Option<String>,
+        attention_reason: Option<String>,
+        blocked_reason: Option<String>,
+        message: &str,
+    ) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let mut patch = IssuePatch::empty();
+        patch.status = Some(status);
+        patch.owner_type = Some(owner_type);
+        patch.owner_name = Some(owner_name);
+        patch.attention_reason = Some(attention_reason);
+        patch.blocked_reason = Some(blocked_reason);
+        let updated = self.store.update_issue(issue.local_id, &patch)?;
+        self.reload()?;
+        self.select_issue(updated.local_id);
+        self.status_message = format!("{message}: {}", updated.identifier);
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SavedView {
-    Active,
-    Unsynced,
-    Archived,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedView {
+    Inbox,
+    Running,
+    Review,
+    Waiting,
+    Done,
+    Scratch,
+}
+
+impl SavedView {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Running => "running",
+            Self::Review => "review",
+            Self::Waiting => "waiting",
+            Self::Done => "done",
+            Self::Scratch => "scratch",
+        }
+    }
 }
 
 fn empty_to_none(value: &str) -> Option<String> {
@@ -637,8 +855,10 @@ mod tests {
         Ok(App {
             config,
             issues: Vec::new(),
+            scratch_items: Vec::new(),
             selected: 0,
             query: IssueQuery::default(),
+            saved_view: SavedView::Inbox,
             status_message: String::new(),
             queued_mutation_count: 0,
             editor: None,
@@ -668,7 +888,77 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))?;
 
         let editor = app.editor.expect("editor should still be open");
-        assert_eq!(editor.status, crate::domain::IssueStatus::InProgress);
+        assert_eq!(editor.status, crate::domain::IssueStatus::ReadyForAgent);
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_capture_creates_scratch_item() -> Result<()> {
+        let mut app = test_app()?;
+        app.begin_scratch_editor();
+
+        for ch in "follow up with support".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        assert_eq!(app.saved_view, SavedView::Scratch);
+        assert_eq!(app.scratch_items.len(), 1);
+        assert_eq!(app.scratch_items[0].body, "follow up with support");
+        Ok(())
+    }
+
+    #[test]
+    fn inbox_views_filter_by_terminal_state() -> Result<()> {
+        let mut app = test_app()?;
+        let mut running = IssueDraft::new("Agent run", "Agent is working");
+        running.status = IssueStatus::AgentRunning;
+        let mut review = IssueDraft::new("Needs review", "Waiting on approval");
+        review.status = IssueStatus::NeedsReview;
+        let mut done = IssueDraft::new("Closed loop", "Already finished");
+        done.status = IssueStatus::Done;
+
+        app.store.create_issue(&running)?;
+        app.store.create_issue(&review)?;
+        app.store.create_issue(&done)?;
+
+        app.set_saved_view(SavedView::Running);
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].status, IssueStatus::AgentRunning);
+
+        app.set_saved_view(SavedView::Review);
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].status, IssueStatus::NeedsReview);
+
+        app.set_saved_view(SavedView::Done);
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].status, IssueStatus::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_actions_persist_owner_and_attention() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Handoff", "Track next actor"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.send_current_issue_to_agent()?;
+        let issue = app.store.get_issue(issue.local_id)?.expect("issue missing");
+        assert_eq!(issue.status, IssueStatus::ReadyForAgent);
+        assert_eq!(issue.owner_type, OwnerType::Agent);
+        assert_eq!(
+            issue.attention_reason.as_deref(),
+            Some("ready for agent pickup")
+        );
+
+        app.request_review()?;
+        let issue = app.store.get_issue(issue.local_id)?.expect("issue missing");
+        assert_eq!(issue.status, IssueStatus::NeedsReview);
+        assert_eq!(issue.owner_type, OwnerType::Human);
+        assert_eq!(issue.owner_name.as_deref(), Some("reviewer"));
         Ok(())
     }
 }

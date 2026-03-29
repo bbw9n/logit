@@ -142,7 +142,7 @@ mod tests {
         assert!(store.list_pending_mutations()?.is_empty());
 
         let mut patch = IssuePatch::empty();
-        patch.status = Some(IssueStatus::InProgress);
+        patch.status = Some(IssueStatus::AgentRunning);
         let updated = store.update_issue(synced.local_id, &patch)?;
         assert_eq!(updated.sync_state, SyncState::PendingUpdate);
 

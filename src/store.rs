@@ -1,6 +1,6 @@
 use crate::domain::{
-    Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, Priority, QueuedMutation,
-    QueuedMutationKind, SyncState,
+    Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority, QueuedMutation,
+    QueuedMutationKind, ScratchItem, ScratchSource, SyncState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -25,7 +25,7 @@ impl Store {
 
     pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
-            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at
+            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at
              FROM issues WHERE 1 = 1",
         );
         let mut params = Vec::new();
@@ -41,7 +41,7 @@ impl Store {
         }
         if let Some(status) = &query.status {
             sql.push_str(" AND status = ?");
-            params.push(encode_status(status).to_string());
+            params.push(status.code().to_string());
         }
         if let Some(search) = query
             .search
@@ -67,7 +67,7 @@ impl Store {
     pub fn get_issue(&self, local_id: i64) -> Result<Option<Issue>> {
         self.conn
             .query_row(
-                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at
+                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at
                  FROM issues WHERE local_id = ?1",
                 [local_id],
                 map_issue_row,
@@ -76,19 +76,109 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn list_scratch_items(&self) -> Result<Vec<ScratchItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, body, source, created_at, promoted_issue_id
+             FROM scratch_items
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ScratchItem {
+                id: row.get(0)?,
+                body: row.get(1)?,
+                source: decode_scratch_source(&row.get::<_, String>(2)?)?,
+                created_at: parse_dt(row.get::<_, String>(3)?).map_err(to_sql_conversion_error)?,
+                promoted_issue_id: row.get(4)?,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_scratch_item(
+        &self,
+        body: impl Into<String>,
+        source: ScratchSource,
+    ) -> Result<ScratchItem> {
+        let body = body.into();
+        let created_at = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO scratch_items (body, source, created_at, promoted_issue_id)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![body, encode_scratch_source(&source), created_at],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_scratch_item(id)?
+            .context("created scratch item missing from database")
+    }
+
+    pub fn get_scratch_item(&self, id: i64) -> Result<Option<ScratchItem>> {
+        self.conn
+            .query_row(
+                "SELECT id, body, source, created_at, promoted_issue_id
+                 FROM scratch_items
+                 WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(ScratchItem {
+                        id: row.get(0)?,
+                        body: row.get(1)?,
+                        source: decode_scratch_source(&row.get::<_, String>(2)?)?,
+                        created_at: parse_dt(row.get::<_, String>(3)?)
+                            .map_err(to_sql_conversion_error)?,
+                        promoted_issue_id: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn promote_scratch_to_issue(&self, scratch_id: i64) -> Result<Issue> {
+        let scratch = self
+            .get_scratch_item(scratch_id)?
+            .with_context(|| format!("scratch item {scratch_id} not found"))?;
+        if let Some(issue_id) = scratch.promoted_issue_id {
+            return self
+                .get_issue(issue_id)?
+                .with_context(|| format!("promoted issue {issue_id} not found"));
+        }
+
+        let title = scratch
+            .body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| format!("Scratch item {}", scratch.id));
+        let description = scratch.body.trim().to_string();
+
+        let issue = self.create_issue(&IssueDraft::new(title, description))?;
+        self.conn.execute(
+            "UPDATE scratch_items SET promoted_issue_id = ?1 WHERE id = ?2",
+            params![issue.local_id, scratch_id],
+        )?;
+        self.get_issue(issue.local_id)?
+            .with_context(|| format!("promoted issue {} missing", issue.local_id))
+    }
+
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'pending_create', ?8)",
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at)
+             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, 'pending_create', ?12)",
             params![
                 draft.title,
                 draft.description,
                 draft.project,
                 encode_labels(&draft.labels)?,
-                encode_status(&draft.status),
+                draft.status.code(),
                 encode_priority(&draft.priority),
                 draft.assignee,
+                draft.owner_type.code(),
+                draft.owner_name,
+                draft.attention_reason,
+                draft.blocked_reason,
                 now.to_rfc3339()
             ],
         )?;
@@ -125,18 +215,39 @@ impl Store {
                  status = ?5,
                  priority = ?6,
                  assignee = ?7,
-                 is_archived = ?8,
-                 sync_state = ?9,
-                 updated_at = ?10
-             WHERE local_id = ?11",
+                 owner_type = ?8,
+                 owner_name = ?9,
+                 attention_reason = ?10,
+                 blocked_reason = ?11,
+                 is_archived = ?12,
+                 sync_state = ?13,
+                 updated_at = ?14
+             WHERE local_id = ?15",
             params![
                 patch.title.as_deref().unwrap_or(&current.title),
                 patch.description.as_deref().unwrap_or(&current.description),
                 patch.project.clone().unwrap_or(current.project.clone()),
                 encode_labels(patch.labels.as_ref().unwrap_or(&current.labels),)?,
-                encode_status(patch.status.as_ref().unwrap_or(&current.status)),
+                patch.status.as_ref().unwrap_or(&current.status).code(),
                 encode_priority(patch.priority.as_ref().unwrap_or(&current.priority)),
                 patch.assignee.clone().unwrap_or(current.assignee.clone()),
+                patch
+                    .owner_type
+                    .as_ref()
+                    .unwrap_or(&current.owner_type)
+                    .code(),
+                patch
+                    .owner_name
+                    .clone()
+                    .unwrap_or(current.owner_name.clone()),
+                patch
+                    .attention_reason
+                    .clone()
+                    .unwrap_or(current.attention_reason.clone()),
+                patch
+                    .blocked_reason
+                    .clone()
+                    .unwrap_or(current.blocked_reason.clone()),
                 patch.is_archived.unwrap_or(current.is_archived),
                 encode_sync_state(&next_sync_state),
                 Utc::now().to_rfc3339(),
@@ -298,6 +409,10 @@ impl Store {
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 assignee TEXT,
+                owner_type TEXT NOT NULL DEFAULT 'unassigned',
+                owner_name TEXT,
+                attention_reason TEXT,
+                blocked_reason TEXT,
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 sync_state TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -309,31 +424,156 @@ impl Store {
                 created_at TEXT NOT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS scratch_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                body TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                promoted_issue_id INTEGER
             );",
         )?;
-        let columns = self
-            .conn
-            .prepare("PRAGMA table_info(issues)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .collect::<Vec<_>>();
-        if !columns.iter().any(|column| column == "is_archived") {
+        let issue_columns = self.table_columns("issues")?;
+        if !issue_columns.iter().any(|column| column == "is_archived") {
             self.conn.execute(
                 "ALTER TABLE issues ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
-        if !columns.iter().any(|column| column == "project") {
+        if !issue_columns.iter().any(|column| column == "project") {
             self.conn
                 .execute("ALTER TABLE issues ADD COLUMN project TEXT", [])?;
         }
-        if !columns.iter().any(|column| column == "labels_json") {
+        if !issue_columns.iter().any(|column| column == "labels_json") {
             self.conn.execute(
                 "ALTER TABLE issues ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'",
                 [],
             )?;
         }
+        if !issue_columns.iter().any(|column| column == "owner_type") {
+            self.conn.execute(
+                "ALTER TABLE issues ADD COLUMN owner_type TEXT NOT NULL DEFAULT 'unassigned'",
+                [],
+            )?;
+        }
+        if !issue_columns.iter().any(|column| column == "owner_name") {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN owner_name TEXT", [])?;
+        }
+        if !issue_columns
+            .iter()
+            .any(|column| column == "attention_reason")
+        {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN attention_reason TEXT", [])?;
+        }
+        if !issue_columns
+            .iter()
+            .any(|column| column == "blocked_reason")
+        {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN blocked_reason TEXT", [])?;
+        }
+        let queued_columns = self.table_columns("queued_mutations")?;
+        if !queued_columns
+            .iter()
+            .any(|column| column == "attempt_count")
+        {
+            self.conn.execute(
+                "ALTER TABLE queued_mutations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !queued_columns.iter().any(|column| column == "last_error") {
+            self.conn.execute(
+                "ALTER TABLE queued_mutations ADD COLUMN last_error TEXT",
+                [],
+            )?;
+        }
+        let scratch_columns = self.table_columns("scratch_items")?;
+        if !scratch_columns
+            .iter()
+            .any(|column| column == "promoted_issue_id")
+        {
+            self.conn.execute(
+                "ALTER TABLE scratch_items ADD COLUMN promoted_issue_id INTEGER",
+                [],
+            )?;
+        }
+        self.normalize_issue_rows()?;
+        self.normalize_queued_mutations()?;
+        Ok(())
+    }
+
+    fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let columns = self
+            .conn
+            .prepare(&pragma)?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(columns)
+    }
+
+    fn normalize_issue_rows(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE issues
+             SET status = 'agent_running'
+             WHERE status = 'in_progress'",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET labels_json = '[]'
+             WHERE labels_json IS NULL OR TRIM(labels_json) = ''",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET identifier = 'LOCAL-' || local_id
+             WHERE identifier IS NULL OR TRIM(identifier) = ''",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET sync_state = CASE
+                 WHEN remote_id IS NULL THEN 'pending_create'
+                 ELSE 'pending_update'
+             END
+             WHERE sync_state IS NULL OR TRIM(sync_state) = ''",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET owner_type = 'unassigned'
+             WHERE owner_type IS NULL OR TRIM(owner_type) = ''",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET attention_reason = CASE
+                 WHEN status = 'ready_for_agent' THEN 'ready for agent pickup'
+                 WHEN status = 'agent_running' THEN 'agent is currently working'
+                 WHEN status = 'needs_human_input' THEN 'human decision needed'
+                 WHEN status = 'needs_review' THEN 'review requested'
+                 WHEN status = 'blocked' THEN 'blocked and waiting'
+                 WHEN status = 'done' THEN 'closed loop'
+                 ELSE 'needs triage'
+             END
+             WHERE attention_reason IS NULL OR TRIM(attention_reason) = ''",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn normalize_queued_mutations(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE queued_mutations
+             SET kind_json = REPLACE(kind_json, '\"InProgress\"', '\"AgentRunning\"')
+             WHERE kind_json LIKE '%\"InProgress\"%'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -347,13 +587,20 @@ impl Store {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, is_archived, sync_state, updated_at)
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at)
              VALUES
-             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'Core', '[\"offline\",\"ux\"]', 'in_progress', 'high', 'you', 0, 'synced', ?1),
-             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'Personal', '[\"draft\"]', 'todo', 'medium', NULL, 0, 'pending_create', ?1)",
-            [now],
+             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'Core', '[\"offline\",\"ux\"]', 'needs_review', 'high', 'you', 'human', 'reviewer', 'review requested', NULL, 0, 'synced', ?1),
+             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'Personal', '[\"draft\"]', 'todo', 'medium', NULL, 'unassigned', NULL, 'needs triage', NULL, 0, 'pending_create', ?1)",
+            [now.clone()],
         )?;
         self.enqueue(QueuedMutationKind::CreateIssue { issue_local_id: 2 })?;
+        self.conn.execute(
+            "INSERT INTO scratch_items (body, source, created_at, promoted_issue_id)
+             VALUES
+             ('Investigate why daily review loops still happen outside the tracker.', 'manual', ?1, NULL),
+             ('Agent suggested splitting flaky sync QA into a separate follow-up.', 'agent', ?1, NULL)",
+            [now],
+        )?;
         Ok(())
     }
 }
@@ -378,10 +625,10 @@ mod tests {
 
         let mut patch = IssuePatch::empty();
         patch.title = Some("Write and test the CRUD layer".into());
-        patch.status = Some(IssueStatus::InProgress);
+        patch.status = Some(IssueStatus::AgentRunning);
         let updated = store.update_issue(created.local_id, &patch)?;
         assert_eq!(updated.title, "Write and test the CRUD layer");
-        assert_eq!(updated.status, IssueStatus::InProgress);
+        assert_eq!(updated.status, IssueStatus::AgentRunning);
 
         assert!(store.delete_issue(created.local_id)?);
         assert!(store.get_issue(created.local_id)?.is_none());
@@ -411,11 +658,11 @@ mod tests {
 
         let in_progress = {
             let mut patch = IssuePatch::empty();
-            patch.status = Some(IssueStatus::InProgress);
+            patch.status = Some(IssueStatus::AgentRunning);
             store.update_issue(local.local_id, &patch)?
         };
         let filtered = store.list_issues(&IssueQuery {
-            status: Some(IssueStatus::InProgress),
+            status: Some(IssueStatus::AgentRunning),
             search: Some("offline".into()),
             ..IssueQuery::default()
         })?;
@@ -554,6 +801,103 @@ mod tests {
         assert_eq!(by_label[0].local_id, created.local_id);
         Ok(())
     }
+
+    #[test]
+    fn scratch_items_can_be_promoted_to_issues() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let scratch = store.create_scratch_item(
+            "Follow up with customer about yesterday's blocked handoff",
+            ScratchSource::Manual,
+        )?;
+
+        let promoted = store.promote_scratch_to_issue(scratch.id)?;
+        assert_eq!(
+            promoted.title,
+            "Follow up with customer about yesterday's blocked handoff"
+        );
+
+        let scratch = store
+            .get_scratch_item(scratch.id)?
+            .expect("scratch item should still exist");
+        assert_eq!(scratch.promoted_issue_id, Some(promoted.local_id));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_schema_is_migrated_across_tables() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id TEXT,
+                identifier TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                assignee TEXT,
+                sync_state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE queued_mutations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE scratch_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                body TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        )?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO issues (remote_id, identifier, title, description, status, priority, assignee, sync_state, updated_at)
+             VALUES (NULL, '', 'Legacy issue', 'Created before v2', 'in_progress', 'medium', NULL, 'pending_create', ?1)",
+            [now.clone()],
+        )?;
+        conn.execute(
+            "INSERT INTO queued_mutations (kind_json, created_at)
+             VALUES (?1, ?2)",
+            params![r#"{"CreateIssue":{"issue_local_id":1}}"#, now.clone()],
+        )?;
+        conn.execute(
+            "INSERT INTO queued_mutations (kind_json, created_at)
+             VALUES (?1, ?2)",
+            params![
+                r#"{"UpdateIssue":{"issue_local_id":1,"patch":{"title":null,"description":null,"project":null,"labels":null,"status":"InProgress","priority":null,"assignee":null,"is_archived":null}}}"#,
+                now.clone()
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO scratch_items (body, source, created_at)
+             VALUES ('Legacy scratch', 'manual', ?1)",
+            [now],
+        )?;
+
+        let store = Store::from_connection(conn, false)?;
+
+        let issue = store.get_issue(1)?.expect("legacy issue should migrate");
+        assert_eq!(issue.status, IssueStatus::AgentRunning);
+        assert_eq!(issue.identifier, "LOCAL-1");
+        assert_eq!(issue.labels, Vec::<String>::new());
+
+        let scratch = store
+            .get_scratch_item(1)?
+            .expect("legacy scratch should migrate");
+        assert_eq!(scratch.promoted_issue_id, None);
+
+        let pending = store.list_pending_mutations()?;
+        assert_eq!(pending.len(), 2);
+        match &pending[1].kind {
+            QueuedMutationKind::UpdateIssue { patch, .. } => {
+                assert_eq!(patch.status, Some(IssueStatus::AgentRunning));
+            }
+            other => panic!("expected migrated update mutation, got {other:?}"),
+        }
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -568,9 +912,13 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         status: decode_status(&row.get::<_, String>(7)?)?,
         priority: decode_priority(&row.get::<_, String>(8)?)?,
         assignee: row.get(9)?,
-        is_archived: row.get::<_, i64>(10)? != 0,
-        sync_state: decode_sync_state(&row.get::<_, String>(11)?)?,
-        updated_at: parse_dt(row.get::<_, String>(12)?).map_err(to_sql_conversion_error)?,
+        owner_type: decode_owner_type(&row.get::<_, String>(10)?)?,
+        owner_name: row.get(11)?,
+        attention_reason: row.get(12)?,
+        blocked_reason: row.get(13)?,
+        is_archived: row.get::<_, i64>(14)? != 0,
+        sync_state: decode_sync_state(&row.get::<_, String>(15)?)?,
+        updated_at: parse_dt(row.get::<_, String>(16)?).map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -589,7 +937,11 @@ fn parse_dt(value: String) -> std::result::Result<DateTime<Utc>, chrono::ParseEr
 fn decode_status(value: &str) -> rusqlite::Result<IssueStatus> {
     match value {
         "todo" => Ok(IssueStatus::Todo),
-        "in_progress" => Ok(IssueStatus::InProgress),
+        "ready_for_agent" => Ok(IssueStatus::ReadyForAgent),
+        "agent_running" => Ok(IssueStatus::AgentRunning),
+        "needs_human_input" => Ok(IssueStatus::NeedsHumanInput),
+        "needs_review" => Ok(IssueStatus::NeedsReview),
+        "blocked" => Ok(IssueStatus::Blocked),
         "done" => Ok(IssueStatus::Done),
         other => Err(to_sql_conversion_error(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -626,11 +978,15 @@ fn decode_sync_state(value: &str) -> rusqlite::Result<SyncState> {
     }
 }
 
-fn encode_status(status: &IssueStatus) -> &'static str {
-    match status {
-        IssueStatus::Todo => "todo",
-        IssueStatus::InProgress => "in_progress",
-        IssueStatus::Done => "done",
+fn decode_owner_type(value: &str) -> rusqlite::Result<OwnerType> {
+    match value {
+        "human" => Ok(OwnerType::Human),
+        "agent" => Ok(OwnerType::Agent),
+        "unassigned" => Ok(OwnerType::Unassigned),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown owner type {other}"),
+        ))),
     }
 }
 
@@ -641,6 +997,28 @@ fn encode_priority(priority: &Priority) -> &'static str {
         Priority::Medium => "medium",
         Priority::High => "high",
         Priority::Urgent => "urgent",
+    }
+}
+
+fn encode_scratch_source(source: &ScratchSource) -> &'static str {
+    match source {
+        ScratchSource::Manual => "manual",
+        ScratchSource::Agent => "agent",
+        ScratchSource::RunFailure => "run_failure",
+        ScratchSource::Pasted => "pasted",
+    }
+}
+
+fn decode_scratch_source(value: &str) -> rusqlite::Result<ScratchSource> {
+    match value {
+        "manual" => Ok(ScratchSource::Manual),
+        "agent" => Ok(ScratchSource::Agent),
+        "run_failure" => Ok(ScratchSource::RunFailure),
+        "pasted" => Ok(ScratchSource::Pasted),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown scratch source {other}"),
+        ))),
     }
 }
 

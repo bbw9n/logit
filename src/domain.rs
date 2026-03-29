@@ -25,15 +25,24 @@ impl SyncState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IssueStatus {
     Todo,
-    InProgress,
+    ReadyForAgent,
+    #[serde(alias = "InProgress")]
+    AgentRunning,
+    NeedsHumanInput,
+    NeedsReview,
+    Blocked,
     Done,
 }
 
 impl IssueStatus {
     pub fn cycle(&self) -> Self {
         match self {
-            Self::Todo => Self::InProgress,
-            Self::InProgress => Self::Done,
+            Self::Todo => Self::ReadyForAgent,
+            Self::ReadyForAgent => Self::AgentRunning,
+            Self::AgentRunning => Self::NeedsHumanInput,
+            Self::NeedsHumanInput => Self::NeedsReview,
+            Self::NeedsReview => Self::Blocked,
+            Self::Blocked => Self::Done,
             Self::Done => Self::Todo,
         }
     }
@@ -41,9 +50,29 @@ impl IssueStatus {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Todo => "todo",
-            Self::InProgress => "in progress",
+            Self::ReadyForAgent => "ready for agent",
+            Self::AgentRunning => "agent running",
+            Self::NeedsHumanInput => "needs human input",
+            Self::NeedsReview => "needs review",
+            Self::Blocked => "blocked",
             Self::Done => "done",
         }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::ReadyForAgent => "ready_for_agent",
+            Self::AgentRunning => "agent_running",
+            Self::NeedsHumanInput => "needs_human_input",
+            Self::NeedsReview => "needs_review",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+        }
+    }
+
+    pub fn is_inbox_relevant(&self) -> bool {
+        !matches!(self, Self::Done)
     }
 }
 
@@ -79,6 +108,31 @@ impl Priority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OwnerType {
+    Human,
+    Agent,
+    Unassigned,
+}
+
+impl OwnerType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Unassigned => "unassigned",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Unassigned => "unassigned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Issue {
     pub local_id: i64,
     pub remote_id: Option<String>,
@@ -90,6 +144,10 @@ pub struct Issue {
     pub status: IssueStatus,
     pub priority: Priority,
     pub assignee: Option<String>,
+    pub owner_type: OwnerType,
+    pub owner_name: Option<String>,
+    pub attention_reason: Option<String>,
+    pub blocked_reason: Option<String>,
     pub is_archived: bool,
     pub sync_state: SyncState,
     pub updated_at: DateTime<Utc>,
@@ -104,6 +162,10 @@ pub struct IssueDraft {
     pub status: IssueStatus,
     pub priority: Priority,
     pub assignee: Option<String>,
+    pub owner_type: OwnerType,
+    pub owner_name: Option<String>,
+    pub attention_reason: Option<String>,
+    pub blocked_reason: Option<String>,
 }
 
 impl IssueDraft {
@@ -116,6 +178,10 @@ impl IssueDraft {
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             assignee: None,
+            owner_type: OwnerType::Unassigned,
+            owner_name: None,
+            attention_reason: Some("new local task".into()),
+            blocked_reason: None,
         }
     }
 }
@@ -129,6 +195,10 @@ pub struct IssuePatch {
     pub status: Option<IssueStatus>,
     pub priority: Option<Priority>,
     pub assignee: Option<Option<String>>,
+    pub owner_type: Option<OwnerType>,
+    pub owner_name: Option<Option<String>>,
+    pub attention_reason: Option<Option<String>>,
+    pub blocked_reason: Option<Option<String>>,
     pub is_archived: Option<bool>,
 }
 
@@ -142,6 +212,10 @@ impl IssuePatch {
             status: None,
             priority: None,
             assignee: None,
+            owner_type: None,
+            owner_name: None,
+            attention_reason: None,
+            blocked_reason: None,
             is_archived: None,
         }
     }
@@ -154,6 +228,34 @@ pub struct IssueQuery {
     pub archived_only: bool,
     pub status: Option<IssueStatus>,
     pub search: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ScratchSource {
+    Manual,
+    Agent,
+    RunFailure,
+    Pasted,
+}
+
+impl ScratchSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Agent => "agent",
+            Self::RunFailure => "run failure",
+            Self::Pasted => "pasted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScratchItem {
+    pub id: i64,
+    pub body: String,
+    pub source: ScratchSource,
+    pub created_at: DateTime<Utc>,
+    pub promoted_issue_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
