@@ -74,15 +74,138 @@ pub struct EditorState {
     pub mode: EditorMode,
     pub focus: EditorFocus,
     pub title: String,
+    pub title_cursor: usize,
     pub description: String,
+    pub description_cursor: usize,
     pub project: String,
+    pub project_cursor: usize,
     pub labels: String,
+    pub labels_cursor: usize,
     pub assignee: String,
+    pub assignee_cursor: usize,
     pub status: IssueStatus,
     pub priority: Priority,
     pub search: String,
+    pub search_cursor: usize,
     pub scratch_source: ScratchSource,
     pub follow_up_needed: bool,
+}
+
+impl EditorState {
+    fn insert_char(&mut self, ch: char) {
+        match self.mode {
+            EditorMode::Search => insert_char_at(&mut self.search, &mut self.search_cursor, ch),
+            _ => match self.focus {
+                EditorFocus::Title => insert_char_at(&mut self.title, &mut self.title_cursor, ch),
+                EditorFocus::Description => {
+                    insert_char_at(&mut self.description, &mut self.description_cursor, ch)
+                }
+                EditorFocus::Project => {
+                    insert_char_at(&mut self.project, &mut self.project_cursor, ch)
+                }
+                EditorFocus::Labels => {
+                    insert_char_at(&mut self.labels, &mut self.labels_cursor, ch)
+                }
+                EditorFocus::Assignee => {
+                    insert_char_at(&mut self.assignee, &mut self.assignee_cursor, ch)
+                }
+            },
+        }
+    }
+
+    fn backspace(&mut self) {
+        match self.mode {
+            EditorMode::Search => backspace_at(&mut self.search, &mut self.search_cursor),
+            _ => match self.focus {
+                EditorFocus::Title => backspace_at(&mut self.title, &mut self.title_cursor),
+                EditorFocus::Description => {
+                    backspace_at(&mut self.description, &mut self.description_cursor)
+                }
+                EditorFocus::Project => backspace_at(&mut self.project, &mut self.project_cursor),
+                EditorFocus::Labels => backspace_at(&mut self.labels, &mut self.labels_cursor),
+                EditorFocus::Assignee => {
+                    backspace_at(&mut self.assignee, &mut self.assignee_cursor)
+                }
+            },
+        }
+    }
+
+    fn move_left(&mut self) {
+        match self.mode {
+            EditorMode::Search => self.search_cursor = self.search_cursor.saturating_sub(1),
+            _ => match self.focus {
+                EditorFocus::Title => self.title_cursor = self.title_cursor.saturating_sub(1),
+                EditorFocus::Description => {
+                    self.description_cursor = self.description_cursor.saturating_sub(1)
+                }
+                EditorFocus::Project => self.project_cursor = self.project_cursor.saturating_sub(1),
+                EditorFocus::Labels => self.labels_cursor = self.labels_cursor.saturating_sub(1),
+                EditorFocus::Assignee => {
+                    self.assignee_cursor = self.assignee_cursor.saturating_sub(1)
+                }
+            },
+        }
+    }
+
+    fn move_right(&mut self) {
+        match self.mode {
+            EditorMode::Search => {
+                self.search_cursor = move_right_cursor(&self.search, self.search_cursor)
+            }
+            _ => match self.focus {
+                EditorFocus::Title => {
+                    self.title_cursor = move_right_cursor(&self.title, self.title_cursor)
+                }
+                EditorFocus::Description => {
+                    self.description_cursor =
+                        move_right_cursor(&self.description, self.description_cursor)
+                }
+                EditorFocus::Project => {
+                    self.project_cursor = move_right_cursor(&self.project, self.project_cursor)
+                }
+                EditorFocus::Labels => {
+                    self.labels_cursor = move_right_cursor(&self.labels, self.labels_cursor)
+                }
+                EditorFocus::Assignee => {
+                    self.assignee_cursor = move_right_cursor(&self.assignee, self.assignee_cursor)
+                }
+            },
+        }
+    }
+
+    fn move_home(&mut self) {
+        match self.mode {
+            EditorMode::Search => self.search_cursor = 0,
+            _ => match self.focus {
+                EditorFocus::Title => self.title_cursor = 0,
+                EditorFocus::Description => self.description_cursor = 0,
+                EditorFocus::Project => self.project_cursor = 0,
+                EditorFocus::Labels => self.labels_cursor = 0,
+                EditorFocus::Assignee => self.assignee_cursor = 0,
+            },
+        }
+    }
+
+    fn move_end(&mut self) {
+        match self.mode {
+            EditorMode::Search => self.search_cursor = self.search.chars().count(),
+            _ => match self.focus {
+                EditorFocus::Title => self.title_cursor = self.title.chars().count(),
+                EditorFocus::Description => {
+                    self.description_cursor = self.description.chars().count()
+                }
+                EditorFocus::Project => self.project_cursor = self.project.chars().count(),
+                EditorFocus::Labels => self.labels_cursor = self.labels.chars().count(),
+                EditorFocus::Assignee => self.assignee_cursor = self.assignee.chars().count(),
+            },
+        }
+    }
+
+    fn insert_newline(&mut self) {
+        if !matches!(self.mode, EditorMode::Search) {
+            self.insert_char('\n');
+        }
+    }
 }
 
 pub struct App {
@@ -111,6 +234,11 @@ struct GitContextPrefill {
     repo_path: String,
     worktree_path: Option<String>,
     branch_name: Option<String>,
+    git_status_summary: Option<String>,
+    dirty_file_count: i64,
+    staged_file_count: i64,
+    ahead_count: i64,
+    behind_count: i64,
 }
 
 impl App {
@@ -248,18 +376,24 @@ impl App {
             mode: EditorMode::Create,
             focus: EditorFocus::Title,
             title: String::new(),
+            title_cursor: 0,
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
         self.status_message =
-            "Creating a local issue. Tab moves fields, Ctrl+S/Ctrl+P cycle status and priority."
+            "Creating a local issue. Tab moves fields, arrows move the cursor, Ctrl+J inserts a newline."
                 .into();
     }
 
@@ -274,13 +408,30 @@ impl App {
             },
             focus: EditorFocus::Title,
             title: issue.title.clone(),
+            title_cursor: issue.title.chars().count(),
             description: issue.description.clone(),
+            description_cursor: issue.description.chars().count(),
             project: issue.project.clone().unwrap_or_default(),
+            project_cursor: issue.project.as_deref().unwrap_or_default().chars().count(),
             labels: issue.labels.join(", "),
+            labels_cursor: issue.labels.join(", ").chars().count(),
             assignee: issue.assignee.clone().unwrap_or_default(),
+            assignee_cursor: issue
+                .assignee
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count(),
             status: issue.status.clone(),
             priority: issue.priority.clone(),
             search: self.query.search.clone().unwrap_or_default(),
+            search_cursor: self
+                .query
+                .search
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count(),
             scratch_source: ScratchSource::Manual,
             follow_up_needed: issue.follow_up_needed,
         });
@@ -292,13 +443,25 @@ impl App {
             mode: EditorMode::Search,
             focus: EditorFocus::Title,
             title: String::new(),
+            title_cursor: 0,
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: self.query.search.clone().unwrap_or_default(),
+            search_cursor: self
+                .query
+                .search
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count(),
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -311,13 +474,19 @@ impl App {
             mode: EditorMode::ScratchCapture,
             focus: EditorFocus::Title,
             title: String::new(),
+            title_cursor: 0,
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -339,13 +508,19 @@ impl App {
             mode: EditorMode::RunNote { run_id: run.id },
             focus: EditorFocus::Title,
             title: String::new(),
+            title_cursor: 0,
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -370,13 +545,19 @@ impl App {
             },
             focus: EditorFocus::Title,
             title: String::new(),
+            title_cursor: 0,
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: Priority::Medium,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -388,24 +569,31 @@ impl App {
             self.status_message = "No issue selected to close out".into();
             return;
         };
+        let closeout_summary = issue.closeout_summary.clone().unwrap_or_default();
         self.editor = Some(EditorState {
             mode: EditorMode::Closeout {
                 local_id: issue.local_id,
             },
             focus: EditorFocus::Title,
-            title: issue.closeout_summary.unwrap_or_default(),
+            title: closeout_summary.clone(),
+            title_cursor: closeout_summary.chars().count(),
             description: String::new(),
+            description_cursor: 0,
             project: String::new(),
+            project_cursor: 0,
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Done,
             priority: issue.priority,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: issue.follow_up_needed,
         });
         self.status_message =
-            "Write a closeout summary. Ctrl+F toggles follow-up, Enter closes the issue.".into();
+            "Write a closeout summary. Ctrl+F toggles follow-up, arrows move the cursor, Ctrl+J inserts a newline.".into();
     }
 
     pub fn begin_work_context_editor(&mut self) {
@@ -420,30 +608,44 @@ impl App {
                 repo_path: ctx.repo_path.clone(),
                 worktree_path: ctx.worktree_path.clone(),
                 branch_name: ctx.branch_name.clone(),
+                git_status_summary: ctx.git_status_summary.clone(),
+                dirty_file_count: ctx.dirty_file_count,
+                staged_file_count: ctx.staged_file_count,
+                ahead_count: ctx.ahead_count,
+                behind_count: ctx.behind_count,
             })
             .or_else(detect_git_context_prefill);
+        let repo_path = detected
+            .as_ref()
+            .map(|ctx| ctx.repo_path.clone())
+            .unwrap_or_default();
+        let worktree_path = detected
+            .as_ref()
+            .and_then(|ctx| ctx.worktree_path.clone())
+            .unwrap_or_default();
+        let branch_name = detected
+            .as_ref()
+            .and_then(|ctx| ctx.branch_name.clone())
+            .unwrap_or_default();
         self.editor = Some(EditorState {
             mode: EditorMode::WorkContext {
                 issue_local_id: issue.local_id,
             },
             focus: EditorFocus::Title,
-            title: detected
-                .as_ref()
-                .map(|ctx| ctx.repo_path.clone())
-                .unwrap_or_default(),
-            description: detected
-                .as_ref()
-                .and_then(|ctx| ctx.worktree_path.clone())
-                .unwrap_or_default(),
-            project: detected
-                .as_ref()
-                .and_then(|ctx| ctx.branch_name.clone())
-                .unwrap_or_default(),
+            title: repo_path.clone(),
+            title_cursor: repo_path.chars().count(),
+            description: worktree_path.clone(),
+            description_cursor: worktree_path.chars().count(),
+            project: branch_name.clone(),
+            project_cursor: branch_name.chars().count(),
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: issue.priority,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -472,14 +674,20 @@ impl App {
                 issue_local_id: issue.local_id,
             },
             focus: EditorFocus::Title,
-            title: detected.0,
-            description: detected.1,
-            project: detected.2,
+            title: detected.0.clone(),
+            title_cursor: detected.0.chars().count(),
+            description: detected.1.clone(),
+            description_cursor: detected.1.chars().count(),
+            project: detected.2.clone(),
+            project_cursor: detected.2.chars().count(),
             labels: String::new(),
+            labels_cursor: 0,
             assignee: String::new(),
+            assignee_cursor: 0,
             status: IssueStatus::Todo,
             priority: issue.priority,
             search: String::new(),
+            search_cursor: 0,
             scratch_source: ScratchSource::Manual,
             follow_up_needed: false,
         });
@@ -571,6 +779,11 @@ impl App {
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
         };
+        self.ensure_terminal_context(issue.local_id)?;
+        let session_ref = self
+            .active_session_link
+            .as_ref()
+            .map(|session| session.session_ref.clone());
         let run = self.store.create_run(
             issue.local_id,
             if issue.owner_type == OwnerType::Agent {
@@ -579,7 +792,16 @@ impl App {
                 RunKind::Manual
             },
             Some("Started from TUI"),
+            session_ref.as_deref(),
         )?;
+        if let Some(note) = build_run_context_note(
+            self.active_work_context.as_ref(),
+            self.active_session_link.as_ref(),
+        ) {
+            let _ = self
+                .store
+                .append_run_event(run.id, RunEventLevel::Info, &note)?;
+        }
         let mut patch = IssuePatch::empty();
         patch.status = Some(IssueStatus::AgentRunning);
         patch.attention_reason = Some(Some("execution in progress".into()));
@@ -772,6 +994,11 @@ impl App {
                 self.status_message = "Cancelled input".into();
                 return Ok(false);
             }
+            KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.insert_newline();
+                }
+            }
             KeyCode::Enter => {
                 self.submit_editor()?;
                 return Ok(false);
@@ -792,28 +1019,32 @@ impl App {
             }
             KeyCode::Backspace => {
                 if let Some(editor) = self.editor.as_mut() {
-                    match editor.mode {
-                        EditorMode::Search => {
-                            editor.search.pop();
-                        }
-                        _ => match editor.focus {
-                            EditorFocus::Title => {
-                                editor.title.pop();
-                            }
-                            EditorFocus::Description => {
-                                editor.description.pop();
-                            }
-                            EditorFocus::Project => {
-                                editor.project.pop();
-                            }
-                            EditorFocus::Labels => {
-                                editor.labels.pop();
-                            }
-                            EditorFocus::Assignee => {
-                                editor.assignee.pop();
-                            }
-                        },
-                    }
+                    editor.backspace();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.move_right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.move_home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.move_end();
+                }
+            }
+            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.insert_newline();
                 }
             }
             KeyCode::Char('s') if key.modifiers == KeyModifiers::CONTROL => {
@@ -853,16 +1084,7 @@ impl App {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 if let Some(editor) = self.editor.as_mut() {
-                    match editor.mode {
-                        EditorMode::Search => editor.search.push(ch),
-                        _ => match editor.focus {
-                            EditorFocus::Title => editor.title.push(ch),
-                            EditorFocus::Description => editor.description.push(ch),
-                            EditorFocus::Project => editor.project.push(ch),
-                            EditorFocus::Labels => editor.labels.push(ch),
-                            EditorFocus::Assignee => editor.assignee.push(ch),
-                        },
-                    }
+                    editor.insert_char(ch);
                 }
             }
             _ => {}
@@ -1013,11 +1235,39 @@ impl App {
                 } else {
                     editor.title.trim().to_string()
                 };
+                let git_snapshot = detect_git_context_prefill_for_path(
+                    editor
+                        .description
+                        .trim()
+                        .split_once('\n')
+                        .map(|(first, _)| first)
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(repo_path.as_str()),
+                );
                 self.store.set_active_work_context(
                     issue_local_id,
                     &repo_path,
                     empty_to_none(&editor.description).as_deref(),
                     empty_to_none(&editor.project).as_deref(),
+                    git_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.git_status_summary.as_deref()),
+                    git_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.dirty_file_count)
+                        .unwrap_or(0),
+                    git_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.staged_file_count)
+                        .unwrap_or(0),
+                    git_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.ahead_count)
+                        .unwrap_or(0),
+                    git_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.behind_count)
+                        .unwrap_or(0),
                 )?;
                 self.reload()?;
                 self.select_issue(issue_local_id);
@@ -1276,6 +1526,38 @@ impl App {
         );
         Ok(())
     }
+
+    fn ensure_terminal_context(&mut self, issue_local_id: i64) -> Result<()> {
+        if self.active_work_context.is_none() {
+            if let Some(prefill) = detect_git_context_prefill() {
+                let context = self.store.set_active_work_context(
+                    issue_local_id,
+                    &prefill.repo_path,
+                    prefill.worktree_path.as_deref(),
+                    prefill.branch_name.as_deref(),
+                    prefill.git_status_summary.as_deref(),
+                    prefill.dirty_file_count,
+                    prefill.staged_file_count,
+                    prefill.ahead_count,
+                    prefill.behind_count,
+                )?;
+                self.active_work_context = Some(context);
+            }
+        }
+
+        if self.active_session_link.is_none() {
+            let (label, kind, session_ref) = default_session_prefill();
+            let session = self.store.set_active_session_link(
+                issue_local_id,
+                &session_ref,
+                parse_session_kind(&kind),
+                &label,
+            )?;
+            self.active_session_link = Some(session);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1329,11 +1611,20 @@ fn parse_session_kind(value: &str) -> SessionKind {
 
 fn detect_git_context_prefill() -> Option<GitContextPrefill> {
     let cwd = env::current_dir().ok()?;
+    detect_git_context_prefill_for_path(&cwd.display().to_string())
+}
+
+fn detect_git_context_prefill_for_path(path: &str) -> Option<GitContextPrefill> {
+    let cwd = PathBuf::from(path);
     let cwd_display = cwd.display().to_string();
-    let repo_root = command_stdout(&cwd, "git", &["rev-parse", "--show-toplevel"])
+    let repo_root = command_stdout(cwd.as_path(), "git", &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
-        .unwrap_or(cwd.clone());
+        .unwrap_or_else(|| cwd.clone());
     let branch_name = command_stdout(&cwd, "git", &["branch", "--show-current"]);
+    let status_snapshot = command_stdout(&cwd, "git", &["status", "--porcelain", "--branch"])
+        .as_deref()
+        .map(parse_git_status_snapshot)
+        .unwrap_or_default();
     let worktree_path = if repo_root != cwd {
         Some(cwd_display)
     } else {
@@ -1344,6 +1635,11 @@ fn detect_git_context_prefill() -> Option<GitContextPrefill> {
         repo_path: repo_root.display().to_string(),
         worktree_path,
         branch_name,
+        git_status_summary: status_snapshot.summary,
+        dirty_file_count: status_snapshot.dirty_file_count,
+        staged_file_count: status_snapshot.staged_file_count,
+        ahead_count: status_snapshot.ahead_count,
+        behind_count: status_snapshot.behind_count,
     })
 }
 
@@ -1374,6 +1670,136 @@ fn default_session_prefill() -> (String, String, String) {
         "human_terminal".into(),
         format!("pid:{}", std::process::id()),
     )
+}
+
+#[derive(Debug, Default)]
+struct GitStatusSnapshot {
+    summary: Option<String>,
+    dirty_file_count: i64,
+    staged_file_count: i64,
+    ahead_count: i64,
+    behind_count: i64,
+}
+
+fn parse_git_status_snapshot(output: &str) -> GitStatusSnapshot {
+    let mut snapshot = GitStatusSnapshot::default();
+
+    for (index, line) in output.lines().enumerate() {
+        if index == 0 && line.starts_with("## ") {
+            if let Some((ahead, behind)) = parse_branch_counts(line) {
+                snapshot.ahead_count = ahead;
+                snapshot.behind_count = behind;
+            }
+            continue;
+        }
+
+        let chars: Vec<char> = line.chars().collect();
+        if chars.len() < 2 {
+            continue;
+        }
+        let staged = chars[0];
+        let unstaged = chars[1];
+        if staged != ' ' && staged != '?' {
+            snapshot.staged_file_count += 1;
+        }
+        if unstaged != ' ' || (staged == '?' && unstaged == '?') {
+            snapshot.dirty_file_count += 1;
+        }
+    }
+
+    let mut parts = Vec::new();
+    if snapshot.dirty_file_count > 0 {
+        parts.push(format!("dirty {}", snapshot.dirty_file_count));
+    }
+    if snapshot.staged_file_count > 0 {
+        parts.push(format!("staged {}", snapshot.staged_file_count));
+    }
+    if snapshot.ahead_count > 0 {
+        parts.push(format!("ahead {}", snapshot.ahead_count));
+    }
+    if snapshot.behind_count > 0 {
+        parts.push(format!("behind {}", snapshot.behind_count));
+    }
+    if parts.is_empty() {
+        parts.push("clean".into());
+    }
+    snapshot.summary = Some(parts.join(" | "));
+    snapshot
+}
+
+fn parse_branch_counts(line: &str) -> Option<(i64, i64)> {
+    let mut ahead = 0;
+    let mut behind = 0;
+    let start = line.find('[')?;
+    let end = line[start..].find(']')? + start;
+    let payload = &line[start + 1..end];
+    for part in payload.split(',') {
+        let trimmed = part.trim();
+        if let Some(value) = trimmed.strip_prefix("ahead ") {
+            ahead = value.parse().ok()?;
+        } else if let Some(value) = trimmed.strip_prefix("behind ") {
+            behind = value.parse().ok()?;
+        }
+    }
+    Some((ahead, behind))
+}
+
+fn build_run_context_note(
+    work_context: Option<&WorkContext>,
+    session_link: Option<&SessionLink>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(context) = work_context {
+        parts.push(format!(
+            "repo={} branch={}",
+            context.repo_path,
+            context.branch_name.as_deref().unwrap_or("none")
+        ));
+        if let Some(summary) = &context.git_status_summary {
+            parts.push(format!("git={summary}"));
+        }
+    }
+    if let Some(session) = session_link {
+        parts.push(format!(
+            "session={} [{}]",
+            session.label,
+            session.session_kind.label()
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Run context: {}", parts.join(" | ")))
+    }
+}
+
+fn insert_char_at(value: &mut String, cursor: &mut usize, ch: char) {
+    let byte_index = char_to_byte_index(value, *cursor);
+    value.insert(byte_index, ch);
+    *cursor += 1;
+}
+
+fn backspace_at(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let start = char_to_byte_index(value, cursor.saturating_sub(1));
+    let end = char_to_byte_index(value, *cursor);
+    value.replace_range(start..end, "");
+    *cursor = cursor.saturating_sub(1);
+}
+
+fn move_right_cursor(value: &str, cursor: usize) -> usize {
+    let max = value.chars().count();
+    (cursor + 1).min(max)
+}
+
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| value.len())
 }
 
 #[cfg(test)]
@@ -1526,8 +1952,17 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
-        assert_eq!(app.run_events.len(), 1);
-        assert!(app.run_events[0].message.contains("checked output"));
+        assert!(!app.run_events.is_empty());
+        assert!(
+            app.run_events
+                .iter()
+                .any(|event| event.message.contains("checked output"))
+        );
+        assert!(
+            app.run_events
+                .iter()
+                .any(|event| event.message.contains("Run context:"))
+        );
 
         app.begin_artifact_editor();
         for ch in "proof saved".chars() {

@@ -646,6 +646,7 @@ fn render_editor(frame: &mut Frame, app: &App, palette: Palette) {
                     EditorFocus::Title,
                     EditorFocus::Title,
                     &editor.search,
+                    editor.search_cursor,
                     palette,
                 ),
             ],
@@ -721,8 +722,9 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("1. Move with j/k or arrow keys."),
         Line::from("2. Press n to create or e to edit."),
         Line::from("3. Press x to capture rough notes before they become full issues."),
-        Line::from("4. Use Tab to move fields, Enter to save, Esc to cancel."),
-        Line::from("5. Search with / and switch saved views with 1 through 6."),
+        Line::from("4. Use Tab to move fields, arrows/Home/End to move cursor, Enter to save."),
+        Line::from("5. Use Ctrl+J or Shift+Enter inside a modal to insert a newline."),
+        Line::from("6. Search with / and switch saved views with 1 through 6."),
         Line::from(""),
         Line::from("Views"),
         Line::from("1 inbox"),
@@ -786,7 +788,7 @@ fn issue_editor_lines(
             Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
-            "Enter saves. Esc cancels. Ctrl+S/Ctrl+P cycle status and priority.",
+            "Enter saves. Esc cancels. Arrows/Home/End move cursor. Ctrl+J or Shift+Enter inserts a newline.",
             Style::default().fg(palette.muted),
         )),
         Line::from(""),
@@ -795,6 +797,7 @@ fn issue_editor_lines(
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
         field_line(
@@ -802,6 +805,7 @@ fn issue_editor_lines(
             editor.focus,
             EditorFocus::Description,
             &editor.description,
+            editor.description_cursor,
             palette,
         ),
         field_line(
@@ -809,6 +813,7 @@ fn issue_editor_lines(
             editor.focus,
             EditorFocus::Project,
             &editor.project,
+            editor.project_cursor,
             palette,
         ),
         field_line(
@@ -816,6 +821,7 @@ fn issue_editor_lines(
             editor.focus,
             EditorFocus::Labels,
             &editor.labels,
+            editor.labels_cursor,
             palette,
         ),
         field_line(
@@ -823,6 +829,7 @@ fn issue_editor_lines(
             editor.focus,
             EditorFocus::Assignee,
             &editor.assignee,
+            editor.assignee_cursor,
             palette,
         ),
         Line::from(vec![
@@ -854,7 +861,7 @@ fn scratch_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> V
             Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
-            "Enter saves. Esc cancels. Ctrl+O cycles the source.",
+            "Enter saves. Esc cancels. Arrows/Home/End move cursor. Ctrl+O cycles the source.",
             Style::default().fg(palette.muted),
         )),
         Line::from(""),
@@ -863,6 +870,7 @@ fn scratch_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> V
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
         Line::from(vec![
@@ -887,7 +895,7 @@ fn note_editor_lines(
             Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
-            "Enter saves. Esc cancels.",
+            "Enter saves. Esc cancels. Arrows/Home/End move cursor. Ctrl+J or Shift+Enter inserts a newline.",
             Style::default().fg(palette.muted),
         )),
         Line::from(""),
@@ -896,6 +904,7 @@ fn note_editor_lines(
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
     ]
@@ -908,7 +917,7 @@ fn closeout_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> 
             Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
-            "Enter saves. Esc cancels. Ctrl+F toggles follow-up.",
+            "Enter saves. Esc cancels. Ctrl+F toggles follow-up. Arrows/Home/End move cursor. Ctrl+J or Shift+Enter inserts a newline.",
             Style::default().fg(palette.muted),
         )),
         Line::from(""),
@@ -917,6 +926,7 @@ fn closeout_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> 
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
         Line::from(vec![
@@ -957,6 +967,7 @@ fn work_context_editor_lines(
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
         field_line(
@@ -964,6 +975,7 @@ fn work_context_editor_lines(
             editor.focus,
             EditorFocus::Description,
             &editor.description,
+            editor.description_cursor,
             palette,
         ),
         field_line(
@@ -971,6 +983,7 @@ fn work_context_editor_lines(
             editor.focus,
             EditorFocus::Project,
             &editor.project,
+            editor.project_cursor,
             palette,
         ),
     ]
@@ -995,6 +1008,7 @@ fn session_link_editor_lines(
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            editor.title_cursor,
             palette,
         ),
         field_line(
@@ -1002,6 +1016,7 @@ fn session_link_editor_lines(
             editor.focus,
             EditorFocus::Description,
             &editor.description,
+            editor.description_cursor,
             palette,
         ),
         field_line(
@@ -1009,6 +1024,7 @@ fn session_link_editor_lines(
             editor.focus,
             EditorFocus::Project,
             &editor.project,
+            editor.project_cursor,
             palette,
         ),
     ]
@@ -1019,6 +1035,7 @@ fn field_line(
     current: EditorFocus,
     target: EditorFocus,
     value: &str,
+    cursor: usize,
     palette: Palette,
 ) -> Line<'static> {
     let prefix = if matches_focus(current, target) {
@@ -1026,7 +1043,7 @@ fn field_line(
     } else {
         " "
     };
-    let content = if value.is_empty() { "(empty)" } else { value };
+    let content = render_field_content(value, cursor, matches_focus(current, target));
     Line::from(vec![
         Span::styled(
             format!("{prefix} "),
@@ -1042,8 +1059,35 @@ fn field_line(
                 .fg(palette.title)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(content.to_string(), Style::default().fg(palette.soft)),
+        Span::styled(content, Style::default().fg(palette.soft)),
     ])
+}
+
+fn render_field_content(value: &str, cursor: usize, focused: bool) -> String {
+    let mut display = String::new();
+    let clamped = cursor.min(value.chars().count());
+    for (index, ch) in value.chars().enumerate() {
+        if focused && index == clamped {
+            display.push('|');
+        }
+        if ch == '\n' {
+            display.push_str(" ↵ ");
+        } else {
+            display.push(ch);
+        }
+    }
+    if focused && clamped == value.chars().count() {
+        display.push('|');
+    }
+    if display.is_empty() {
+        if focused {
+            "|".into()
+        } else {
+            "(empty)".into()
+        }
+    } else {
+        display
+    }
 }
 
 fn matches_focus(current: EditorFocus, target: EditorFocus) -> bool {
@@ -1288,6 +1332,9 @@ fn timeline_line_for_context(app: &App, palette: Palette) -> Line<'static> {
         ));
         if let Some(worktree) = &ctx.worktree_path {
             parts.push(format!("wt={worktree}"));
+        }
+        if let Some(summary) = &ctx.git_status_summary {
+            parts.push(format!("git={summary}"));
         }
     }
     if let Some(session) = &app.active_session_link {

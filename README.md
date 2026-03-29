@@ -13,6 +13,7 @@ What works today:
 - Scratch capture and promotion into full issues
 - Local run tracking with run notes and evidence snippets
 - Active worktree and session context per issue
+- Git snapshot context on attached worktrees
 - Closeout summaries with follow-up tracking
 - Handoff history and reopen flow
 - SQLite-backed persistence
@@ -66,6 +67,8 @@ cargo test --locked
 - `i`: promote the selected scratch item into a full issue
 - `Enter`: save the current modal
 - `Tab` / `Shift+Tab`: move between modal fields
+- `Left` / `Right` / `Home` / `End`: move the cursor inside the active modal field
+- `Ctrl+J` or `Shift+Enter`: insert a newline inside the active modal field
 - `s`: cycle issue status
 - `p`: cycle issue priority
 - `h`: send the selected issue to an agent
@@ -127,6 +130,7 @@ When you open the work-context modal, `logit` now tries to prefill:
 - repo root from `git rev-parse --show-toplevel`
 - current branch from `git branch --show-current`
 - current working directory as the worktree path when it differs from the repo root
+- lightweight git status snapshot counts from `git status --porcelain --branch`
 
 Outside a git repo, it falls back gracefully to your current working directory.
 
@@ -135,6 +139,12 @@ When you open the session-link modal without an existing session attached, it pr
 - label: `local terminal`
 - kind: `human_terminal`
 - session ref: `pid:<current-process-id>`
+
+When you start a run with `t`, `logit` now also tries to:
+
+- ensure there is an active work context and session link
+- store the active session reference on the run record
+- append a run note summarizing the current repo/branch/git snapshot/session context
 
 ## Data Storage
 
@@ -194,6 +204,7 @@ The current test suite covers:
 - Inbox view filtering by terminal-native issue state
 - Run lifecycle, run notes, and evidence capture
 - Work context and session-link persistence
+- Git snapshot and run session-ref persistence
 - Closeout summaries and follow-up flags
 - Handoff history and reopen transitions
 - Mutation queue cleanup

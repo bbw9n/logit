@@ -257,7 +257,7 @@ impl Store {
     pub fn get_active_work_context(&self, issue_local_id: i64) -> Result<Option<WorkContext>> {
         self.conn
             .query_row(
-                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at
+                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, git_status_summary, dirty_file_count, staged_file_count, ahead_count, behind_count, is_active, created_at, updated_at
                  FROM work_contexts
                  WHERE issue_local_id = ?1 AND is_active = 1
                  ORDER BY updated_at DESC, id DESC
@@ -275,13 +275,29 @@ impl Store {
         repo_path: &str,
         worktree_path: Option<&str>,
         branch_name: Option<&str>,
+        git_status_summary: Option<&str>,
+        dirty_file_count: i64,
+        staged_file_count: i64,
+        ahead_count: i64,
+        behind_count: i64,
     ) -> Result<WorkContext> {
         self.clear_active_work_context(issue_local_id)?;
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
-            params![issue_local_id, repo_path, worktree_path, branch_name, now],
+            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, git_status_summary, dirty_file_count, staged_file_count, ahead_count, behind_count, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+            params![
+                issue_local_id,
+                repo_path,
+                worktree_path,
+                branch_name,
+                git_status_summary,
+                dirty_file_count,
+                staged_file_count,
+                ahead_count,
+                behind_count,
+                now
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         self.get_work_context(id)?
@@ -347,11 +363,18 @@ impl Store {
         issue_local_id: i64,
         kind: RunKind,
         summary: Option<&str>,
+        session_ref: Option<&str>,
     ) -> Result<RunRecord> {
         self.conn.execute(
             "INSERT INTO runs (issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref)
-             VALUES (?1, ?2, 'running', ?3, NULL, ?4, NULL, NULL)",
-            params![issue_local_id, kind.code(), Utc::now().to_rfc3339(), summary],
+             VALUES (?1, ?2, 'running', ?3, NULL, ?4, NULL, ?5)",
+            params![
+                issue_local_id,
+                kind.code(),
+                Utc::now().to_rfc3339(),
+                summary,
+                session_ref
+            ],
         )?;
         let run_id = self.conn.last_insert_rowid();
         self.get_run(run_id)?
@@ -658,7 +681,7 @@ impl Store {
     fn get_work_context(&self, id: i64) -> Result<Option<WorkContext>> {
         self.conn
             .query_row(
-                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at
+                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, git_status_summary, dirty_file_count, staged_file_count, ahead_count, behind_count, is_active, created_at, updated_at
                  FROM work_contexts
                  WHERE id = ?1",
                 [id],
@@ -832,6 +855,11 @@ impl Store {
                 repo_path TEXT NOT NULL,
                 worktree_path TEXT,
                 branch_name TEXT,
+                git_status_summary TEXT,
+                dirty_file_count INTEGER NOT NULL DEFAULT 0,
+                staged_file_count INTEGER NOT NULL DEFAULT 0,
+                ahead_count INTEGER NOT NULL DEFAULT 0,
+                behind_count INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -944,6 +972,52 @@ impl Store {
             self.conn
                 .execute("ALTER TABLE runs ADD COLUMN session_ref TEXT", [])?;
         }
+        let work_context_columns = self.table_columns("work_contexts")?;
+        if !work_context_columns
+            .iter()
+            .any(|column| column == "git_status_summary")
+        {
+            self.conn.execute(
+                "ALTER TABLE work_contexts ADD COLUMN git_status_summary TEXT",
+                [],
+            )?;
+        }
+        if !work_context_columns
+            .iter()
+            .any(|column| column == "dirty_file_count")
+        {
+            self.conn.execute(
+                "ALTER TABLE work_contexts ADD COLUMN dirty_file_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !work_context_columns
+            .iter()
+            .any(|column| column == "staged_file_count")
+        {
+            self.conn.execute(
+                "ALTER TABLE work_contexts ADD COLUMN staged_file_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !work_context_columns
+            .iter()
+            .any(|column| column == "ahead_count")
+        {
+            self.conn.execute(
+                "ALTER TABLE work_contexts ADD COLUMN ahead_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !work_context_columns
+            .iter()
+            .any(|column| column == "behind_count")
+        {
+            self.conn.execute(
+                "ALTER TABLE work_contexts ADD COLUMN behind_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         self.normalize_issue_rows()?;
         self.normalize_queued_mutations()?;
         Ok(())
@@ -1052,7 +1126,7 @@ impl Store {
         )?;
         self.conn.execute(
             "INSERT INTO runs (issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref)
-             VALUES (1, 'manual', 'succeeded', ?1, ?1, 'Initial local triage run completed', 0, NULL)",
+             VALUES (1, 'manual', 'succeeded', ?1, ?1, 'Initial local triage run completed', 0, 'session-1')",
             [Utc::now().to_rfc3339()],
         )?;
         self.conn.execute(
@@ -1071,8 +1145,8 @@ impl Store {
             [Utc::now().to_rfc3339()],
         )?;
         self.conn.execute(
-            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at)
-             VALUES (1, '/tmp/logit-demo', '/tmp/logit-demo', 'feature/offline-inbox', 1, ?1, ?1)",
+            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, git_status_summary, dirty_file_count, staged_file_count, ahead_count, behind_count, is_active, created_at, updated_at)
+             VALUES (1, '/tmp/logit-demo', '/tmp/logit-demo', 'feature/offline-inbox', 'dirty 2 | staged 1 | ahead 1', 2, 1, 1, 0, 1, ?1, ?1)",
             [Utc::now().to_rfc3339()],
         )?;
         self.conn.execute(
@@ -1377,6 +1451,42 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn work_context_snapshot_and_run_session_ref_round_trip() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let issue = store.create_issue(&IssueDraft::new("Context", "Track execution context"))?;
+
+        store.set_active_work_context(
+            issue.local_id,
+            "/repo",
+            Some("/repo/worktree"),
+            Some("feature/test"),
+            Some("dirty 2 | ahead 1"),
+            2,
+            0,
+            1,
+            0,
+        )?;
+        let context = store
+            .get_active_work_context(issue.local_id)?
+            .expect("work context should exist");
+        assert_eq!(
+            context.git_status_summary.as_deref(),
+            Some("dirty 2 | ahead 1")
+        );
+        assert_eq!(context.dirty_file_count, 2);
+        assert_eq!(context.ahead_count, 1);
+
+        let run = store.create_run(
+            issue.local_id,
+            RunKind::Manual,
+            Some("Started"),
+            Some("pid:123"),
+        )?;
+        assert_eq!(run.session_ref.as_deref(), Some("pid:123"));
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -1461,9 +1571,14 @@ fn map_work_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkContext
         repo_path: row.get(2)?,
         worktree_path: row.get(3)?,
         branch_name: row.get(4)?,
-        is_active: row.get::<_, i64>(5)? != 0,
-        created_at: parse_dt(row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
-        updated_at: parse_dt(row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
+        git_status_summary: row.get(5)?,
+        dirty_file_count: row.get(6)?,
+        staged_file_count: row.get(7)?,
+        ahead_count: row.get(8)?,
+        behind_count: row.get(9)?,
+        is_active: row.get::<_, i64>(10)? != 0,
+        created_at: parse_dt(row.get::<_, String>(11)?).map_err(to_sql_conversion_error)?,
+        updated_at: parse_dt(row.get::<_, String>(12)?).map_err(to_sql_conversion_error)?,
     })
 }
 
