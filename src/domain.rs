@@ -258,6 +258,135 @@ pub struct ScratchItem {
     pub promoted_issue_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunKind {
+    Manual,
+    Agent,
+    Shell,
+    Script,
+}
+
+impl RunKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Agent => "agent",
+            Self::Shell => "shell",
+            Self::Script => "script",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.label()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.label()
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunRecord {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub kind: RunKind,
+    pub status: RunStatus,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub summary: Option<String>,
+    pub exit_code: Option<i64>,
+    pub session_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunEventLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl RunEventLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.label()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunEventRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub level: RunEventLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Note,
+    Output,
+    Link,
+    FileRef,
+}
+
+impl ArtifactKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Output => "output",
+            Self::Link => "link",
+            Self::FileRef => "file",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.label()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub run_id: Option<i64>,
+    pub kind: ArtifactKind,
+    pub content_preview: String,
+    pub location: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueuedMutationKind {
     CreateIssue {

@@ -1,8 +1,9 @@
 use crate::{
     config::WorkspaceConfig,
     domain::{
-        Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority, ScratchItem,
-        ScratchSource, SyncState,
+        ArtifactKind, ArtifactRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus,
+        OwnerType, Priority, RunEventLevel, RunEventRecord, RunKind, RunRecord, RunStatus,
+        ScratchItem, ScratchSource, SyncState,
     },
     store::Store,
     sync::{LinearSyncService, SyncService},
@@ -44,9 +45,18 @@ impl EditorFocus {
 #[derive(Debug, Clone)]
 pub enum EditorMode {
     Create,
-    Edit { local_id: i64 },
+    Edit {
+        local_id: i64,
+    },
     Search,
     ScratchCapture,
+    RunNote {
+        run_id: i64,
+    },
+    ArtifactNote {
+        issue_local_id: i64,
+        run_id: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +78,9 @@ pub struct App {
     pub config: WorkspaceConfig,
     pub issues: Vec<Issue>,
     pub scratch_items: Vec<ScratchItem>,
+    pub runs: Vec<RunRecord>,
+    pub run_events: Vec<RunEventRecord>,
+    pub artifacts: Vec<ArtifactRecord>,
     pub selected: usize,
     pub query: IssueQuery,
     pub saved_view: SavedView,
@@ -88,6 +101,9 @@ impl App {
             config,
             issues: Vec::new(),
             scratch_items: Vec::new(),
+            runs: Vec::new(),
+            run_events: Vec::new(),
+            artifacts: Vec::new(),
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -140,6 +156,11 @@ impl App {
             KeyCode::Char('m') => self.request_human_input()?,
             KeyCode::Char('w') => self.request_review()?,
             KeyCode::Char('b') => self.mark_current_issue_blocked()?,
+            KeyCode::Char('t') => self.start_run()?,
+            KeyCode::Char('g') => self.complete_latest_run_success()?,
+            KeyCode::Char('z') => self.complete_latest_run_failure()?,
+            KeyCode::Char('l') => self.begin_run_note_editor(),
+            KeyCode::Char('o') => self.begin_artifact_editor(),
             KeyCode::Char('v') => self.toggle_archived_visibility(),
             KeyCode::Char('1') => self.set_saved_view(SavedView::Inbox),
             KeyCode::Char('2') => self.set_saved_view(SavedView::Running),
@@ -271,6 +292,61 @@ impl App {
                 .into();
     }
 
+    pub fn begin_run_note_editor(&mut self) {
+        let Some(issue) = self.current_issue() else {
+            self.status_message = "No issue selected for a run note".into();
+            return;
+        };
+        let Ok(Some(run)) = self.store.latest_active_run_for_issue(issue.local_id) else {
+            self.status_message = "No active run available. Press t to start one first.".into();
+            return;
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::RunNote { run_id: run.id },
+            focus: EditorFocus::Title,
+            title: String::new(),
+            description: String::new(),
+            project: String::new(),
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Todo,
+            priority: Priority::Medium,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+        });
+        self.status_message = "Write a run note, then press Enter to attach it.".into();
+    }
+
+    pub fn begin_artifact_editor(&mut self) {
+        let Some(issue) = self.current_issue() else {
+            self.status_message = "No issue selected for evidence".into();
+            return;
+        };
+        let run_id = self
+            .store
+            .latest_active_run_for_issue(issue.local_id)
+            .ok()
+            .flatten()
+            .map(|run| run.id);
+        self.editor = Some(EditorState {
+            mode: EditorMode::ArtifactNote {
+                issue_local_id: issue.local_id,
+                run_id,
+            },
+            focus: EditorFocus::Title,
+            title: String::new(),
+            description: String::new(),
+            project: String::new(),
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Todo,
+            priority: Priority::Medium,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+        });
+        self.status_message = "Write an evidence note, then press Enter to attach it.".into();
+    }
+
     pub fn cycle_status(&mut self) -> Result<()> {
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
@@ -303,6 +379,48 @@ impl App {
             updated.priority.label()
         );
         Ok(())
+    }
+
+    pub fn start_run(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let run = self.store.create_run(
+            issue.local_id,
+            if issue.owner_type == OwnerType::Agent {
+                RunKind::Agent
+            } else {
+                RunKind::Manual
+            },
+            Some("Started from TUI"),
+        )?;
+        let mut patch = IssuePatch::empty();
+        patch.status = Some(IssueStatus::AgentRunning);
+        patch.attention_reason = Some(Some("execution in progress".into()));
+        let _ = self.store.update_issue(issue.local_id, &patch)?;
+        self.reload()?;
+        self.status_message = format!("Started run #{} for {}", run.id, issue.identifier);
+        Ok(())
+    }
+
+    pub fn complete_latest_run_success(&mut self) -> Result<()> {
+        self.complete_latest_run(
+            RunStatus::Succeeded,
+            Some("Run completed successfully"),
+            None,
+            IssueStatus::NeedsReview,
+            "run succeeded; review requested",
+        )
+    }
+
+    pub fn complete_latest_run_failure(&mut self) -> Result<()> {
+        self.complete_latest_run(
+            RunStatus::Failed,
+            Some("Run failed"),
+            Some(1),
+            IssueStatus::NeedsHumanInput,
+            "run failed; human follow-up needed",
+        )
     }
 
     pub fn sync_now(&mut self) -> Result<()> {
@@ -450,6 +568,7 @@ impl App {
         let issues = self.store.list_issues(&self.query)?;
         self.issues = self.filter_issues_for_view(issues);
         self.scratch_items = self.store.list_scratch_items()?;
+        self.refresh_activity()?;
         self.queued_mutation_count = self.store.list_pending_mutations()?.len();
         let len = self.visible_len();
         if len == 0 {
@@ -638,6 +757,37 @@ impl App {
                 self.select_scratch(scratch.id);
                 self.status_message = format!("Captured scratch item #{}", scratch.id);
             }
+            EditorMode::RunNote { run_id } => {
+                let message = if editor.title.trim().is_empty() {
+                    "Captured run note".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                self.store
+                    .append_run_event(run_id, RunEventLevel::Info, &message)?;
+                self.reload()?;
+                self.status_message = "Attached note to active run".into();
+            }
+            EditorMode::ArtifactNote {
+                issue_local_id,
+                run_id,
+            } => {
+                let note = if editor.title.trim().is_empty() {
+                    "Captured evidence note".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                self.store.create_artifact(
+                    issue_local_id,
+                    run_id,
+                    ArtifactKind::Note,
+                    &note,
+                    None,
+                )?;
+                self.reload()?;
+                self.select_issue(issue_local_id);
+                self.status_message = "Attached evidence note".into();
+            }
         }
 
         self.editor = None;
@@ -668,6 +818,7 @@ impl App {
             .position(|issue| issue.local_id == local_id)
         {
             self.selected = index;
+            let _ = self.refresh_activity();
         }
     }
 
@@ -678,6 +829,7 @@ impl App {
             .position(|scratch| scratch.id == scratch_id)
         {
             self.selected = index;
+            let _ = self.refresh_activity();
         }
     }
 
@@ -793,6 +945,55 @@ impl App {
         self.status_message = format!("{message}: {}", updated.identifier);
         Ok(())
     }
+
+    fn refresh_activity(&mut self) -> Result<()> {
+        if let Some(issue) = self.current_issue().cloned() {
+            self.runs = self.store.list_runs_for_issue(issue.local_id)?;
+            self.run_events = self.store.list_run_events_for_issue(issue.local_id)?;
+            self.artifacts = self.store.list_artifacts_for_issue(issue.local_id)?;
+        } else {
+            self.runs.clear();
+            self.run_events.clear();
+            self.artifacts.clear();
+        }
+        Ok(())
+    }
+
+    fn complete_latest_run(
+        &mut self,
+        status: RunStatus,
+        summary: Option<&str>,
+        exit_code: Option<i64>,
+        next_issue_status: IssueStatus,
+        attention_reason: &str,
+    ) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let Some(run) = self.store.latest_active_run_for_issue(issue.local_id)? else {
+            self.status_message = "No active run to complete".into();
+            return Ok(());
+        };
+        let updated_run = self
+            .store
+            .complete_run(run.id, status.clone(), summary, exit_code)?;
+        let mut patch = IssuePatch::empty();
+        patch.status = Some(next_issue_status);
+        patch.attention_reason = Some(Some(attention_reason.into()));
+        if status == RunStatus::Failed {
+            patch.blocked_reason = Some(Some("latest run failed".into()));
+        } else {
+            patch.blocked_reason = Some(None);
+        }
+        let _ = self.store.update_issue(issue.local_id, &patch)?;
+        self.reload()?;
+        self.status_message = format!(
+            "Run #{} marked {}",
+            updated_run.id,
+            updated_run.status.label()
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -856,6 +1057,9 @@ mod tests {
             config,
             issues: Vec::new(),
             scratch_items: Vec::new(),
+            runs: Vec::new(),
+            run_events: Vec::new(),
+            artifacts: Vec::new(),
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -959,6 +1163,42 @@ mod tests {
         assert_eq!(issue.status, IssueStatus::NeedsReview);
         assert_eq!(issue.owner_type, OwnerType::Human);
         assert_eq!(issue.owner_name.as_deref(), Some("reviewer"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_loop_tracks_runs_notes_and_evidence() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Ship run", "Need execution trail"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.start_run()?;
+        assert_eq!(app.runs.len(), 1);
+        assert!(app.runs[0].status.is_active());
+
+        app.begin_run_note_editor();
+        for ch in "checked output".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        assert_eq!(app.run_events.len(), 1);
+        assert!(app.run_events[0].message.contains("checked output"));
+
+        app.begin_artifact_editor();
+        for ch in "proof saved".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        assert_eq!(app.artifacts.len(), 1);
+        assert!(app.artifacts[0].content_preview.contains("proof saved"));
+
+        app.complete_latest_run_success()?;
+        let issue = app.store.get_issue(issue.local_id)?.expect("issue missing");
+        assert_eq!(issue.status, IssueStatus::NeedsReview);
+        assert_eq!(app.runs[0].status, RunStatus::Succeeded);
         Ok(())
     }
 }

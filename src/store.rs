@@ -1,6 +1,7 @@
 use crate::domain::{
-    Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority, QueuedMutation,
-    QueuedMutationKind, ScratchItem, ScratchSource, SyncState,
+    ArtifactKind, ArtifactRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus,
+    OwnerType, Priority, QueuedMutation, QueuedMutationKind, RunEventLevel, RunEventRecord,
+    RunKind, RunRecord, RunStatus, ScratchItem, ScratchSource, SyncState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -160,6 +161,140 @@ impl Store {
         )?;
         self.get_issue(issue.local_id)?
             .with_context(|| format!("promoted issue {} missing", issue.local_id))
+    }
+
+    pub fn list_runs_for_issue(&self, issue_local_id: i64) -> Result<Vec<RunRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref
+             FROM runs
+             WHERE issue_local_id = ?1
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([issue_local_id], map_run_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_active_run_for_issue(&self, issue_local_id: i64) -> Result<Option<RunRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref
+                 FROM runs
+                 WHERE issue_local_id = ?1 AND status IN ('queued', 'running')
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                [issue_local_id],
+                map_run_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_run_events_for_issue(&self, issue_local_id: i64) -> Result<Vec<RunEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_events.id, run_events.run_id, run_events.created_at, run_events.level, run_events.message
+             FROM run_events
+             INNER JOIN runs ON runs.id = run_events.run_id
+             WHERE runs.issue_local_id = ?1
+             ORDER BY run_events.created_at DESC, run_events.id DESC
+             LIMIT 8",
+        )?;
+        let rows = stmt.query_map([issue_local_id], map_run_event_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_artifacts_for_issue(&self, issue_local_id: i64) -> Result<Vec<ArtifactRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_local_id, run_id, kind, content_preview, location, created_at
+             FROM artifacts
+             WHERE issue_local_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 8",
+        )?;
+        let rows = stmt.query_map([issue_local_id], map_artifact_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_run(
+        &self,
+        issue_local_id: i64,
+        kind: RunKind,
+        summary: Option<&str>,
+    ) -> Result<RunRecord> {
+        self.conn.execute(
+            "INSERT INTO runs (issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref)
+             VALUES (?1, ?2, 'running', ?3, NULL, ?4, NULL, NULL)",
+            params![issue_local_id, kind.code(), Utc::now().to_rfc3339(), summary],
+        )?;
+        let run_id = self.conn.last_insert_rowid();
+        self.get_run(run_id)?
+            .context("created run missing from database")
+    }
+
+    pub fn append_run_event(
+        &self,
+        run_id: i64,
+        level: RunEventLevel,
+        message: &str,
+    ) -> Result<RunEventRecord> {
+        self.conn.execute(
+            "INSERT INTO run_events (run_id, created_at, level, message)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, Utc::now().to_rfc3339(), level.code(), message],
+        )?;
+        let event_id = self.conn.last_insert_rowid();
+        self.get_run_event(event_id)?
+            .context("created run event missing from database")
+    }
+
+    pub fn complete_run(
+        &self,
+        run_id: i64,
+        status: RunStatus,
+        summary: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> Result<RunRecord> {
+        self.conn.execute(
+            "UPDATE runs
+             SET status = ?2, ended_at = ?3, summary = COALESCE(?4, summary), exit_code = ?5
+             WHERE id = ?1",
+            params![
+                run_id,
+                status.code(),
+                Utc::now().to_rfc3339(),
+                summary,
+                exit_code
+            ],
+        )?;
+        self.get_run(run_id)?
+            .context("completed run missing from database")
+    }
+
+    pub fn create_artifact(
+        &self,
+        issue_local_id: i64,
+        run_id: Option<i64>,
+        kind: ArtifactKind,
+        content_preview: &str,
+        location: Option<&str>,
+    ) -> Result<ArtifactRecord> {
+        self.conn.execute(
+            "INSERT INTO artifacts (issue_local_id, run_id, kind, content_preview, location, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                issue_local_id,
+                run_id,
+                kind.code(),
+                content_preview,
+                location,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        let artifact_id = self.conn.last_insert_rowid();
+        self.get_artifact(artifact_id)?
+            .context("created artifact missing from database")
     }
 
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
@@ -330,6 +465,45 @@ impl Store {
         self.update_issue(local_id, &patch)
     }
 
+    fn get_run(&self, id: i64) -> Result<Option<RunRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref
+                 FROM runs
+                 WHERE id = ?1",
+                [id],
+                map_run_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_run_event(&self, id: i64) -> Result<Option<RunEventRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, created_at, level, message
+                 FROM run_events
+                 WHERE id = ?1",
+                [id],
+                map_run_event_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_artifact(&self, id: i64) -> Result<Option<ArtifactRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, run_id, kind, content_preview, location, created_at
+                 FROM artifacts
+                 WHERE id = ?1",
+                [id],
+                map_artifact_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn mark_issue_synced(
         &self,
         local_id: i64,
@@ -432,6 +606,36 @@ impl Store {
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 promoted_issue_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                exit_code INTEGER,
+                session_ref TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS run_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                run_id INTEGER,
+                kind TEXT NOT NULL,
+                content_preview TEXT NOT NULL,
+                location TEXT,
+                created_at TEXT NOT NULL
             );",
         )?;
         let issue_columns = self.table_columns("issues")?;
@@ -500,6 +704,19 @@ impl Store {
                 "ALTER TABLE scratch_items ADD COLUMN promoted_issue_id INTEGER",
                 [],
             )?;
+        }
+        let run_columns = self.table_columns("runs")?;
+        if !run_columns.iter().any(|column| column == "summary") {
+            self.conn
+                .execute("ALTER TABLE runs ADD COLUMN summary TEXT", [])?;
+        }
+        if !run_columns.iter().any(|column| column == "exit_code") {
+            self.conn
+                .execute("ALTER TABLE runs ADD COLUMN exit_code INTEGER", [])?;
+        }
+        if !run_columns.iter().any(|column| column == "session_ref") {
+            self.conn
+                .execute("ALTER TABLE runs ADD COLUMN session_ref TEXT", [])?;
         }
         self.normalize_issue_rows()?;
         self.normalize_queued_mutations()?;
@@ -600,6 +817,21 @@ impl Store {
              ('Investigate why daily review loops still happen outside the tracker.', 'manual', ?1, NULL),
              ('Agent suggested splitting flaky sync QA into a separate follow-up.', 'agent', ?1, NULL)",
             [now],
+        )?;
+        self.conn.execute(
+            "INSERT INTO runs (issue_local_id, kind, status, started_at, ended_at, summary, exit_code, session_ref)
+             VALUES (1, 'manual', 'succeeded', ?1, ?1, 'Initial local triage run completed', 0, NULL)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO run_events (run_id, created_at, level, message)
+             VALUES (1, ?1, 'info', 'Reviewed backlog shape and prepared next offline workflow step')",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO artifacts (issue_local_id, run_id, kind, content_preview, location, created_at)
+             VALUES (1, 1, 'note', 'Captured a short closeout note for the seed workflow.', NULL, ?1)",
+            [Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -922,6 +1154,46 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     })
 }
 
+fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        kind: decode_run_kind(&row.get::<_, String>(2)?)?,
+        status: decode_run_status(&row.get::<_, String>(3)?)?,
+        started_at: parse_dt(row.get::<_, String>(4)?).map_err(to_sql_conversion_error)?,
+        ended_at: row
+            .get::<_, Option<String>>(5)?
+            .map(parse_dt)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
+        summary: row.get(6)?,
+        exit_code: row.get(7)?,
+        session_ref: row.get(8)?,
+    })
+}
+
+fn map_run_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunEventRecord> {
+    Ok(RunEventRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        created_at: parse_dt(row.get::<_, String>(2)?).map_err(to_sql_conversion_error)?,
+        level: decode_run_event_level(&row.get::<_, String>(3)?)?,
+        message: row.get(4)?,
+    })
+}
+
+fn map_artifact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
+    Ok(ArtifactRecord {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        run_id: row.get(2)?,
+        kind: decode_artifact_kind(&row.get::<_, String>(3)?)?,
+        content_preview: row.get(4)?,
+        location: row.get(5)?,
+        created_at: parse_dt(row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
+    })
+}
+
 fn encode_labels(labels: &[String]) -> Result<String> {
     Ok(serde_json::to_string(labels)?)
 }
@@ -986,6 +1258,58 @@ fn decode_owner_type(value: &str) -> rusqlite::Result<OwnerType> {
         other => Err(to_sql_conversion_error(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown owner type {other}"),
+        ))),
+    }
+}
+
+fn decode_run_kind(value: &str) -> rusqlite::Result<RunKind> {
+    match value {
+        "manual" => Ok(RunKind::Manual),
+        "agent" => Ok(RunKind::Agent),
+        "shell" => Ok(RunKind::Shell),
+        "script" => Ok(RunKind::Script),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown run kind {other}"),
+        ))),
+    }
+}
+
+fn decode_run_status(value: &str) -> rusqlite::Result<RunStatus> {
+    match value {
+        "queued" => Ok(RunStatus::Queued),
+        "running" => Ok(RunStatus::Running),
+        "succeeded" => Ok(RunStatus::Succeeded),
+        "failed" => Ok(RunStatus::Failed),
+        "cancelled" => Ok(RunStatus::Cancelled),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown run status {other}"),
+        ))),
+    }
+}
+
+fn decode_run_event_level(value: &str) -> rusqlite::Result<RunEventLevel> {
+    match value {
+        "info" => Ok(RunEventLevel::Info),
+        "warn" => Ok(RunEventLevel::Warn),
+        "error" => Ok(RunEventLevel::Error),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown run event level {other}"),
+        ))),
+    }
+}
+
+fn decode_artifact_kind(value: &str) -> rusqlite::Result<ArtifactKind> {
+    match value {
+        "note" => Ok(ArtifactKind::Note),
+        "output" => Ok(ArtifactKind::Output),
+        "link" => Ok(ArtifactKind::Link),
+        "file" => Ok(ArtifactKind::FileRef),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown artifact kind {other}"),
         ))),
     }
 }

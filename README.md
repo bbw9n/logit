@@ -11,6 +11,7 @@ What works today:
 - Local issue creation and editing
 - Terminal-native issue states like `ready for agent`, `agent running`, `needs review`, and `blocked`
 - Scratch capture and promotion into full issues
+- Local run tracking with run notes and evidence snippets
 - SQLite-backed persistence
 - Search across identifier, title, description, project, and labels
 - Project and label organization
@@ -68,6 +69,11 @@ cargo test --locked
 - `m`: mark the selected issue as needing human input
 - `w`: mark the selected issue as needing review
 - `b`: mark the selected issue as blocked
+- `t`: start a local run for the selected issue
+- `g`: mark the latest active run as succeeded
+- `z`: mark the latest active run as failed
+- `l`: attach a note to the latest active run
+- `o`: attach an evidence note to the selected issue
 - `a`: archive or restore the selected issue
 
 ### Views And Search
@@ -148,6 +154,7 @@ The current test suite covers:
 - Project and label persistence
 - Scratch capture and promotion
 - Inbox view filtering by terminal-native issue state
+- Run lifecycle, run notes, and evidence capture
 - Mutation queue cleanup
 - Sync-state transitions
 - Placeholder sync success and failure paths

@@ -423,6 +423,28 @@ fn render_primary_detail(
                 issue.description.clone(),
                 Style::default().fg(palette.soft),
             )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Runs",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_runs(app, palette),
+            Line::from(Span::styled(
+                "Recent Notes",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_events(app, palette),
+            Line::from(Span::styled(
+                "Evidence",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_artifacts(app, palette),
         ])
     } else {
         Text::from(Span::styled(
@@ -488,6 +510,8 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("i", "promote scratch into issue", palette),
         key_line("s / p", "cycle status / priority", palette),
         key_line("h / m / w / b", "agent / human / review / blocked", palette),
+        key_line("t / g / z", "start / succeed / fail run", palette),
+        key_line("l / o", "run note / evidence", palette),
         key_line("a", "archive or restore", palette),
         key_line("v", "show archived", palette),
         key_line("1 / 2 / 3", "inbox / running / review", palette),
@@ -598,6 +622,22 @@ fn render_editor(frame: &mut Frame, app: &App, palette: Palette) {
             ],
         ),
         EditorMode::ScratchCapture => (" Scratch Capture ", scratch_editor_lines(editor, palette)),
+        EditorMode::RunNote { .. } => (
+            " Run Note ",
+            note_editor_lines(
+                "Attach a note to the latest active run for this issue.",
+                editor,
+                palette,
+            ),
+        ),
+        EditorMode::ArtifactNote { .. } => (
+            " Evidence Note ",
+            note_editor_lines(
+                "Attach a local evidence note to this issue.",
+                editor,
+                palette,
+            ),
+        ),
         EditorMode::Create => (
             " New Issue ",
             issue_editor_lines(
@@ -663,6 +703,11 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("m mark selected issue as needing human input"),
         Line::from("w mark selected issue as needing review"),
         Line::from("b mark selected issue as blocked"),
+        Line::from("t start a local run for the selected issue"),
+        Line::from("g mark the latest active run as succeeded"),
+        Line::from("z mark the latest active run as failed"),
+        Line::from("l attach a note to the latest active run"),
+        Line::from("o attach an evidence note to the selected issue"),
         Line::from("a archive or restore selected issue"),
         Line::from("x capture scratch note"),
         Line::from("i promote selected scratch item"),
@@ -786,6 +831,31 @@ fn scratch_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> V
                 badge_bg(source_color(&editor.scratch_source, palette), palette),
             ),
         ]),
+    ]
+}
+
+fn note_editor_lines(
+    intro: &str,
+    editor: &crate::app::EditorState,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            intro.to_string(),
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Enter saves. Esc cancels.",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "note",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            palette,
+        ),
     ]
 }
 
@@ -978,4 +1048,55 @@ fn priority_color(label: &str, palette: Palette) -> Color {
         "urgent" => palette.urgent_priority,
         _ => palette.soft,
     }
+}
+
+fn timeline_line_for_runs(app: &App, palette: Palette) -> Line<'static> {
+    if app.runs.is_empty() {
+        return Line::from(Span::styled(
+            "No runs yet",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .runs
+        .iter()
+        .take(3)
+        .map(|run| format!("#{} {} {}", run.id, run.kind.label(), run.status.label()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
+}
+
+fn timeline_line_for_events(app: &App, palette: Palette) -> Line<'static> {
+    if app.run_events.is_empty() {
+        return Line::from(Span::styled(
+            "No run notes yet",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .run_events
+        .iter()
+        .take(3)
+        .map(|event| format!("[{}] {}", event.level.label(), event.message))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
+}
+
+fn timeline_line_for_artifacts(app: &App, palette: Palette) -> Line<'static> {
+    if app.artifacts.is_empty() {
+        return Line::from(Span::styled(
+            "No evidence yet",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .artifacts
+        .iter()
+        .take(3)
+        .map(|artifact| format!("[{}] {}", artifact.kind.label(), artifact.content_preview))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
 }
