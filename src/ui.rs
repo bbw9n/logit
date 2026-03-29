@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, EditorFocus, EditorMode},
+    app::{App, EditorFocus, EditorMode, InterruptionItem},
     config::ThemePreset,
     domain::{Issue, ScratchItem, ScratchSource},
 };
@@ -195,12 +195,21 @@ fn render_primary_list(
                 .map(|scratch| scratch_list_item(scratch, palette))
                 .collect()
         }
+    } else if app.is_interruptions_view() {
+        if app.interruptions.is_empty() {
+            vec![ListItem::new(empty_state_copy(app))]
+        } else {
+            app.interruptions
+                .iter()
+                .map(|item| interruption_list_item(item, palette))
+                .collect()
+        }
     } else if app.issues.is_empty() {
         vec![ListItem::new(empty_state_copy(app))]
     } else {
         app.issues
             .iter()
-            .map(|issue| issue_list_item(issue, palette))
+            .map(|issue| issue_list_item(app, issue, palette))
             .collect()
     };
 
@@ -222,14 +231,15 @@ fn render_primary_list(
 
     let mut state = ListState::default();
     if (app.is_scratch_view() && !app.scratch_items.is_empty())
-        || (!app.is_scratch_view() && !app.issues.is_empty())
+        || (app.is_interruptions_view() && !app.interruptions.is_empty())
+        || (!app.is_scratch_view() && !app.is_interruptions_view() && !app.issues.is_empty())
     {
         state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn issue_list_item(issue: &Issue, palette: Palette) -> ListItem<'_> {
+fn issue_list_item<'a>(app: &'a App, issue: &'a Issue, palette: Palette) -> ListItem<'a> {
     let status = status_color(issue, palette);
     ListItem::new(vec![
         Line::from(vec![
@@ -250,6 +260,17 @@ fn issue_list_item(issue: &Issue, palette: Palette) -> ListItem<'_> {
                 palette.white,
                 badge_bg(sync_color(issue, palette), palette),
             ),
+            if app.issue_is_stale(issue.local_id) {
+                Span::styled(
+                    " stale-agent ",
+                    Style::default()
+                        .fg(palette.white)
+                        .bg(palette.error_bg)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             if issue.is_archived {
                 Span::styled(
                     " archived ",
@@ -266,6 +287,16 @@ fn issue_list_item(issue: &Issue, palette: Palette) -> ListItem<'_> {
                 .attention_reason
                 .clone()
                 .unwrap_or_else(|| "no explicit attention reason".into()),
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(Span::styled(
+            app.parallel_context_summary(issue)
+                .unwrap_or_else(|| "no parallel dispatch graph".into()),
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            app.graph_navigation_hint(issue)
+                .unwrap_or_else(|| "graph nav unavailable".into()),
             Style::default().fg(palette.muted),
         )),
     ])
@@ -300,6 +331,42 @@ fn scratch_list_item(scratch: &ScratchItem, palette: Palette) -> ListItem<'_> {
                 Span::styled(" unpromoted ", Style::default().fg(palette.soft))
             },
         ]),
+    ])
+}
+
+fn interruption_list_item(item: &InterruptionItem, palette: Palette) -> ListItem<'_> {
+    let kind_color = match item.request.kind {
+        crate::domain::AgentRequestKind::Question => palette.accent,
+        crate::domain::AgentRequestKind::Review => palette.progress,
+        crate::domain::AgentRequestKind::Blocker => palette.urgent_priority,
+    };
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled("! ", Style::default().fg(kind_color)),
+            Span::styled(
+                format!("{:<10}", item.issue.identifier),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(item.request.title.clone()),
+        ]),
+        Line::from(vec![
+            badge(
+                item.request.kind.label(),
+                palette.white,
+                badge_bg(kind_color, palette),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("requested by {}", item.request.requested_by),
+                Style::default().fg(palette.soft),
+            ),
+        ]),
+        Line::from(Span::styled(
+            item.issue.title.clone(),
+            Style::default().fg(palette.muted),
+        )),
     ])
 }
 
@@ -356,6 +423,54 @@ fn render_primary_detail(
                 Style::default().fg(palette.soft),
             )),
         ])
+    } else if let Some(interruption) = app.current_interruption() {
+        Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    &interruption.issue.identifier,
+                    Style::default().fg(palette.accent),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    interruption.request.title.clone(),
+                    Style::default()
+                        .fg(palette.white)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            meta_line("Kind", interruption.request.kind.label(), palette),
+            meta_line("Status", interruption.request.status.label(), palette),
+            meta_line("Issue", interruption.issue.title.as_str(), palette),
+            meta_line("Issue State", interruption.issue.status.label(), palette),
+            meta_line(
+                "Requested By",
+                interruption.request.requested_by.as_str(),
+                palette,
+            ),
+            meta_line(
+                "Parallel",
+                app.parallel_context_summary(&interruption.issue)
+                    .unwrap_or_else(|| "no parallel dispatch graph".to_string()),
+                palette,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Request Body",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                interruption.request.body.clone(),
+                Style::default().fg(palette.soft),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Interruptions are the supervision queue. Press Q to resolve this request.",
+                Style::default().fg(palette.muted),
+            )),
+        ])
     } else if let Some(issue) = app.current_issue() {
         let labels = if issue.labels.is_empty() {
             "none".to_string()
@@ -376,6 +491,26 @@ fn render_primary_detail(
             ]),
             Line::from(""),
             meta_line("Status", issue.status.label(), palette),
+            meta_line(
+                "Parent",
+                issue
+                    .parent_id
+                    .map(|id| format!("LOCAL-{id}"))
+                    .unwrap_or_else(|| "root issue".to_string()),
+                palette,
+            ),
+            meta_line(
+                "Parallel",
+                app.parallel_context_summary(issue)
+                    .unwrap_or_else(|| "no dispatched sub-issues yet".to_string()),
+                palette,
+            ),
+            meta_line(
+                "Graph Nav",
+                app.graph_navigation_hint(issue)
+                    .unwrap_or_else(|| "not part of a dispatch graph".to_string()),
+                palette,
+            ),
             meta_line("Priority", issue.priority.label(), palette),
             meta_line("Owner", issue.owner_type.label(), palette),
             meta_line(
@@ -448,6 +583,20 @@ fn render_primary_detail(
                     .add_modifier(Modifier::BOLD),
             )),
             timeline_line_for_context(app, palette),
+            Line::from(Span::styled(
+                "Dispatch",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_subissues(app, palette),
+            Line::from(Span::styled(
+                "Agent Requests",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_agent_requests(app, palette),
             Line::from(""),
             Line::from(Span::styled(
                 "Runs",
@@ -492,6 +641,8 @@ fn render_primary_detail(
                     "Detail",
                     if app.is_scratch_view() {
                         "selected scratch"
+                    } else if app.is_interruptions_view() {
+                        "selected interruption"
                     } else {
                         "selected issue"
                     },
@@ -538,6 +689,10 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("j/k or arrows", "move", palette),
         key_line("n", "new issue form", palette),
         key_line("e", "edit issue form", palette),
+        key_line("D", "dispatch sub-issue", palette),
+        key_line("R / Q", "open / resolve request", palette),
+        key_line("P / C", "parent / next graph item", palette),
+        key_line("V / J", "approve review / requeue stalled graph", palette),
         key_line("x", "capture scratch item", palette),
         key_line("i", "promote scratch into issue", palette),
         key_line("s / p", "cycle status / priority", palette),
@@ -552,6 +707,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("v", "show archived", palette),
         key_line("1 / 2 / 3", "inbox / running / review", palette),
         key_line("4 / 5 / 6", "waiting / done / scratch", palette),
+        key_line("7", "interruption queue", palette),
         key_line("/", "search", palette),
         key_line("u", "clear search", palette),
         key_line("?", "help overlay", palette),
@@ -567,6 +723,13 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         )),
         Line::from(Span::styled(
             app.attention_summary(),
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "dispatch graphs: {} | sub-issues: {}",
+                app.parallel_parent_count, app.parallel_subissue_count
+            ),
             Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
@@ -601,10 +764,12 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
                 .take(4)
                 .map(|entry| {
                     format!(
-                        "{} {} @ {}",
+                        "{} {} @ {}{} {}",
                         entry.identifier,
                         entry.session_label,
-                        entry.branch_name.as_deref().unwrap_or("no-branch")
+                        entry.branch_name.as_deref().unwrap_or("no-branch"),
+                        if entry.is_stale { " stale" } else { "" },
+                        crate::app::relative_age_label(entry.last_activity_at, chrono::Utc::now())
                     )
                 })
                 .collect::<Vec<_>>()
@@ -719,6 +884,14 @@ fn render_editor(frame: &mut Frame, app: &App, palette: Palette) {
         EditorMode::SessionLink { .. } => {
             (" Session Link ", session_link_editor_lines(editor, palette))
         }
+        EditorMode::DispatchSubissue { .. } => (
+            " Dispatch Sub-Issue ",
+            dispatch_editor_lines(editor, palette),
+        ),
+        EditorMode::AgentRequest { .. } => (
+            " Agent Request ",
+            agent_request_editor_lines(editor, palette),
+        ),
         EditorMode::Closeout { .. } => (" Closeout ", closeout_editor_lines(editor, palette)),
         EditorMode::Create => (
             " New Issue ",
@@ -778,8 +951,16 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("4 waiting"),
         Line::from("5 done"),
         Line::from("6 scratch"),
+        Line::from("7 interruptions"),
         Line::from(""),
         Line::from("Issue actions"),
+        Line::from("D dispatch a sub-issue from the selected issue"),
+        Line::from("R open a structured agent request"),
+        Line::from("Q resolve the latest open agent request"),
+        Line::from("P jump to the parent issue"),
+        Line::from("C move through the dispatch graph"),
+        Line::from("V approve review-ready child issues from the parent graph"),
+        Line::from("J requeue stalled child issues back to agents"),
         Line::from("s cycle status"),
         Line::from("p cycle priority"),
         Line::from("h send selected issue to an agent"),
@@ -993,6 +1174,85 @@ fn closeout_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> 
     ]
 }
 
+fn dispatch_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Split the selected issue into a dispatched sub-issue for parallel work.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Fields: title, description, initial status code (ready_for_agent, todo, needs_review, blocked).",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "title",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            editor.title_cursor,
+            palette,
+        ),
+        field_line(
+            "description",
+            editor.focus,
+            EditorFocus::Description,
+            &editor.description,
+            editor.description_cursor,
+            palette,
+        ),
+        field_line(
+            "status",
+            editor.focus,
+            EditorFocus::Project,
+            &editor.project,
+            editor.project_cursor,
+            palette,
+        ),
+    ]
+}
+
+fn agent_request_editor_lines(
+    editor: &crate::app::EditorState,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Create a structured interruption from an agent to a human.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Fields: title, body, kind (question, review, blocker).",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "title",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            editor.title_cursor,
+            palette,
+        ),
+        field_line(
+            "body",
+            editor.focus,
+            EditorFocus::Description,
+            &editor.description,
+            editor.description_cursor,
+            palette,
+        ),
+        field_line(
+            "kind",
+            editor.focus,
+            EditorFocus::Project,
+            &editor.project,
+            editor.project_cursor,
+            palette,
+        ),
+    ]
+}
+
 fn work_context_editor_lines(
     editor: &crate::app::EditorState,
     palette: Palette,
@@ -1173,6 +1433,8 @@ fn centered_rect(
 fn empty_state_copy(app: &App) -> &'static str {
     if app.is_scratch_view() {
         "No scratch items yet. Press x to capture a note you want to turn into tracked work later."
+    } else if app.is_interruptions_view() {
+        "No open interruptions right now. Agent questions, blockers, and review requests will land here."
     } else if app.saved_view == crate::app::SavedView::Done {
         "No done issues here yet. Close a loop and it will appear in this reviewable history."
     } else {
@@ -1399,4 +1661,50 @@ fn timeline_line_for_context(app: &App, palette: Palette) -> Line<'static> {
         parts.join(" | "),
         Style::default().fg(palette.soft),
     ))
+}
+
+fn timeline_line_for_subissues(app: &App, palette: Palette) -> Line<'static> {
+    if app.subissues.is_empty() {
+        return Line::from(Span::styled(
+            "No dispatched sub-issues",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .subissues
+        .iter()
+        .take(4)
+        .map(|issue| {
+            let graph = app
+                .parallel_context_summary(issue)
+                .unwrap_or_else(|| issue.status.label().to_string());
+            format!("{} {} [{}]", issue.identifier, issue.status.label(), graph)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
+}
+
+fn timeline_line_for_agent_requests(app: &App, palette: Palette) -> Line<'static> {
+    if app.agent_requests.is_empty() {
+        return Line::from(Span::styled(
+            "No structured agent requests",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .agent_requests
+        .iter()
+        .take(4)
+        .map(|request| {
+            format!(
+                "[{}:{}] {}",
+                request.kind.label(),
+                request.status.label(),
+                request.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
 }

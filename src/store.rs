@@ -1,8 +1,8 @@
 use crate::domain::{
-    ArtifactKind, ArtifactRecord, HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery,
-    IssueStatus, OwnerType, Priority, QueuedMutation, QueuedMutationKind, RunEventLevel,
-    RunEventRecord, RunKind, RunRecord, RunStatus, ScratchItem, ScratchSource, SessionKind,
-    SessionLink, SyncState, WorkContext,
+    AgentRequest, AgentRequestKind, AgentRequestStatus, ArtifactKind, ArtifactRecord,
+    HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority,
+    QueuedMutation, QueuedMutationKind, RunEventLevel, RunEventRecord, RunKind, RunRecord,
+    RunStatus, ScratchItem, ScratchSource, SessionKind, SessionLink, SyncState, WorkContext,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -27,7 +27,7 @@ impl Store {
 
     pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
-            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
+            "SELECT local_id, parent_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
              FROM issues WHERE 1 = 1",
         );
         let mut params = Vec::new();
@@ -69,7 +69,7 @@ impl Store {
     pub fn get_issue(&self, local_id: i64) -> Result<Option<Issue>> {
         self.conn
             .query_row(
-                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
+                "SELECT local_id, parent_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
                  FROM issues WHERE local_id = ?1",
                 [local_id],
                 map_issue_row,
@@ -229,6 +229,59 @@ impl Store {
         let rows = stmt.query_map([issue_local_id], map_handoff_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn list_subissues(&self, parent_id: i64) -> Result<Vec<Issue>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT local_id, parent_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
+             FROM issues
+             WHERE parent_id = ?1
+             ORDER BY updated_at DESC, local_id DESC",
+        )?;
+        let rows = stmt.query_map([parent_id], map_issue_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_agent_requests_for_issue(&self, issue_local_id: i64) -> Result<Vec<AgentRequest>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at
+             FROM agent_requests
+             WHERE issue_local_id = ?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([issue_local_id], map_agent_request_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_agent_request(
+        &self,
+        issue_local_id: i64,
+        kind: AgentRequestKind,
+        title: &str,
+        body: &str,
+        requested_by: &str,
+    ) -> Result<AgentRequest> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO agent_requests (issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, NULL)",
+            params![issue_local_id, kind.code(), title, body, requested_by, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_agent_request(id)?
+            .context("created agent request missing from database")
+    }
+
+    pub fn resolve_agent_request(&self, request_id: i64) -> Result<Option<AgentRequest>> {
+        self.conn.execute(
+            "UPDATE agent_requests
+             SET status = 'resolved', resolved_at = ?2
+             WHERE id = ?1 AND status = 'open'",
+            params![request_id, Utc::now().to_rfc3339()],
+        )?;
+        self.get_agent_request(request_id)
     }
 
     pub fn create_handoff(
@@ -448,9 +501,10 @@ impl Store {
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 'pending_create', ?14)",
+            "INSERT INTO issues (parent_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at)
+             VALUES (?1, NULL, '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, 'pending_create', ?15)",
             params![
+                draft.parent_id,
                 draft.title,
                 draft.description,
                 draft.project,
@@ -495,24 +549,26 @@ impl Store {
             "UPDATE issues
              SET title = ?1,
                  description = ?2,
-                 project = ?3,
-                 labels_json = ?4,
-                 status = ?5,
-                 priority = ?6,
-                 assignee = ?7,
-                 owner_type = ?8,
-                 owner_name = ?9,
-                 attention_reason = ?10,
-                 blocked_reason = ?11,
-                 closeout_summary = ?12,
-                 follow_up_needed = ?13,
-                 is_archived = ?14,
-                 sync_state = ?15,
-                 updated_at = ?16
-             WHERE local_id = ?17",
+                 parent_id = ?3,
+                 project = ?4,
+                 labels_json = ?5,
+                 status = ?6,
+                 priority = ?7,
+                 assignee = ?8,
+                 owner_type = ?9,
+                 owner_name = ?10,
+                 attention_reason = ?11,
+                 blocked_reason = ?12,
+                 closeout_summary = ?13,
+                 follow_up_needed = ?14,
+                 is_archived = ?15,
+                 sync_state = ?16,
+                 updated_at = ?17
+             WHERE local_id = ?18",
             params![
                 patch.title.as_deref().unwrap_or(&current.title),
                 patch.description.as_deref().unwrap_or(&current.description),
+                patch.parent_id.clone().unwrap_or(current.parent_id),
                 patch.project.clone().unwrap_or(current.project.clone()),
                 encode_labels(patch.labels.as_ref().unwrap_or(&current.labels),)?,
                 patch.status.as_ref().unwrap_or(&current.status).code(),
@@ -634,6 +690,19 @@ impl Store {
                  WHERE id = ?1",
                 [id],
                 map_run_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_agent_request(&self, id: i64) -> Result<Option<AgentRequest>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at
+                 FROM agent_requests
+                 WHERE id = ?1",
+                [id],
+                map_agent_request_row,
             )
             .optional()
             .map_err(Into::into)
@@ -774,6 +843,7 @@ impl Store {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS issues (
                 local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER,
                 remote_id TEXT,
                 identifier TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -874,9 +944,25 @@ impl Store {
                 last_heartbeat_at TEXT NOT NULL,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
             );",
         )?;
         let issue_columns = self.table_columns("issues")?;
+        if !issue_columns.iter().any(|column| column == "parent_id") {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN parent_id INTEGER", [])?;
+        }
         if !issue_columns.iter().any(|column| column == "is_archived") {
             self.conn.execute(
                 "ALTER TABLE issues ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
@@ -1152,6 +1238,11 @@ impl Store {
         self.conn.execute(
             "INSERT INTO session_links (issue_local_id, session_ref, session_kind, label, last_heartbeat_at, is_active, created_at)
              VALUES (1, 'session-1', 'agent_session', 'Codex worker', ?1, 1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO agent_requests (issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at)
+             VALUES (1, 'review', 'Review merge strategy', 'Need a human to choose the safer rollout path before merge.', 'Codex worker', 'open', ?1, NULL)",
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -1487,29 +1578,80 @@ mod tests {
         assert_eq!(run.session_ref.as_deref(), Some("pid:123"));
         Ok(())
     }
+
+    #[test]
+    fn parent_issue_and_agent_requests_round_trip() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let parent = store.create_issue(&IssueDraft::new("Parent", "Top level task"))?;
+        let mut child = IssueDraft::new("Child", "Parallel subtask");
+        child.parent_id = Some(parent.local_id);
+        let child = store.create_issue(&child)?;
+
+        let subissues = store.list_subissues(parent.local_id)?;
+        assert_eq!(subissues.len(), 1);
+        assert_eq!(subissues[0].local_id, child.local_id);
+
+        let request = store.create_agent_request(
+            parent.local_id,
+            AgentRequestKind::Question,
+            "Need scope decision",
+            "Should this split further?",
+            "Worker A",
+        )?;
+        assert_eq!(request.status, AgentRequestStatus::Open);
+
+        let requests = store.list_agent_requests_for_issue(parent.local_id)?;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].title, "Need scope decision");
+
+        let resolved = store
+            .resolve_agent_request(request.id)?
+            .expect("request should resolve");
+        assert_eq!(resolved.status, AgentRequestStatus::Resolved);
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     Ok(Issue {
         local_id: row.get(0)?,
-        remote_id: row.get(1)?,
-        identifier: row.get(2)?,
+        parent_id: row.get(1)?,
+        remote_id: row.get(2)?,
+        identifier: row.get(3)?,
+        title: row.get(4)?,
+        description: row.get(5)?,
+        project: row.get(6)?,
+        labels: decode_labels(&row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
+        status: decode_status(&row.get::<_, String>(8)?)?,
+        priority: decode_priority(&row.get::<_, String>(9)?)?,
+        assignee: row.get(10)?,
+        owner_type: decode_owner_type(&row.get::<_, String>(11)?)?,
+        owner_name: row.get(12)?,
+        attention_reason: row.get(13)?,
+        blocked_reason: row.get(14)?,
+        closeout_summary: row.get(15)?,
+        follow_up_needed: row.get::<_, i64>(16)? != 0,
+        is_archived: row.get::<_, i64>(17)? != 0,
+        sync_state: decode_sync_state(&row.get::<_, String>(18)?)?,
+        updated_at: parse_dt(row.get::<_, String>(19)?).map_err(to_sql_conversion_error)?,
+    })
+}
+
+fn map_agent_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRequest> {
+    Ok(AgentRequest {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        kind: decode_agent_request_kind(&row.get::<_, String>(2)?)?,
         title: row.get(3)?,
-        description: row.get(4)?,
-        project: row.get(5)?,
-        labels: decode_labels(&row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
-        status: decode_status(&row.get::<_, String>(7)?)?,
-        priority: decode_priority(&row.get::<_, String>(8)?)?,
-        assignee: row.get(9)?,
-        owner_type: decode_owner_type(&row.get::<_, String>(10)?)?,
-        owner_name: row.get(11)?,
-        attention_reason: row.get(12)?,
-        blocked_reason: row.get(13)?,
-        closeout_summary: row.get(14)?,
-        follow_up_needed: row.get::<_, i64>(15)? != 0,
-        is_archived: row.get::<_, i64>(16)? != 0,
-        sync_state: decode_sync_state(&row.get::<_, String>(17)?)?,
-        updated_at: parse_dt(row.get::<_, String>(18)?).map_err(to_sql_conversion_error)?,
+        body: row.get(4)?,
+        requested_by: row.get(5)?,
+        status: decode_agent_request_status(&row.get::<_, String>(6)?)?,
+        created_at: parse_dt(row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
+        resolved_at: row
+            .get::<_, Option<String>>(8)?
+            .map(parse_dt)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -1723,6 +1865,30 @@ fn decode_session_kind(value: &str) -> rusqlite::Result<SessionKind> {
         other => Err(to_sql_conversion_error(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown session kind {other}"),
+        ))),
+    }
+}
+
+fn decode_agent_request_kind(value: &str) -> rusqlite::Result<AgentRequestKind> {
+    match value {
+        "question" => Ok(AgentRequestKind::Question),
+        "review" => Ok(AgentRequestKind::Review),
+        "blocker" => Ok(AgentRequestKind::Blocker),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown agent request kind {other}"),
+        ))),
+    }
+}
+
+fn decode_agent_request_status(value: &str) -> rusqlite::Result<AgentRequestStatus> {
+    match value {
+        "open" => Ok(AgentRequestStatus::Open),
+        "resolved" => Ok(AgentRequestStatus::Resolved),
+        "dismissed" => Ok(AgentRequestStatus::Dismissed),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown agent request status {other}"),
         ))),
     }
 }

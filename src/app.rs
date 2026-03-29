@@ -1,16 +1,18 @@
 use crate::{
     config::WorkspaceConfig,
     domain::{
-        ArtifactKind, ArtifactRecord, HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery,
-        IssueStatus, OwnerType, Priority, RunEventLevel, RunEventRecord, RunKind, RunRecord,
-        RunStatus, ScratchItem, ScratchSource, SessionKind, SessionLink, SyncState, WorkContext,
+        AgentRequest, AgentRequestKind, AgentRequestStatus, ArtifactKind, ArtifactRecord,
+        HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus, OwnerType, Priority,
+        RunEventLevel, RunEventRecord, RunKind, RunRecord, RunStatus, ScratchItem, ScratchSource,
+        SessionKind, SessionLink, SyncState, WorkContext,
     },
     store::Store,
     sync::{LinearSyncService, SyncService},
 };
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::{env, path::PathBuf, process::Command};
+use std::{collections::HashMap, env, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Copy)]
 pub enum EditorFocus {
@@ -48,6 +50,12 @@ pub enum EditorMode {
     Create,
     Edit {
         local_id: i64,
+    },
+    DispatchSubissue {
+        parent_local_id: i64,
+    },
+    AgentRequest {
+        issue_local_id: i64,
     },
     Search,
     ScratchCapture,
@@ -216,10 +224,18 @@ pub struct App {
     pub run_events: Vec<RunEventRecord>,
     pub artifacts: Vec<ArtifactRecord>,
     pub handoffs: Vec<HandoffRecord>,
+    pub subissues: Vec<Issue>,
+    pub agent_requests: Vec<AgentRequest>,
+    pub interruptions: Vec<InterruptionItem>,
     pub active_work_context: Option<WorkContext>,
     pub active_session_link: Option<SessionLink>,
     pub agent_roster: Vec<AgentRosterEntry>,
+    pub dispatch_summaries: HashMap<i64, DispatchSummary>,
     pub needs_human_count: usize,
+    pub stale_agent_count: usize,
+    pub open_agent_request_count: usize,
+    pub parallel_parent_count: usize,
+    pub parallel_subissue_count: usize,
     pub selected: usize,
     pub query: IssueQuery,
     pub saved_view: SavedView,
@@ -245,10 +261,72 @@ struct GitContextPrefill {
 
 #[derive(Debug, Clone)]
 pub struct AgentRosterEntry {
+    pub issue_local_id: i64,
     pub identifier: String,
     pub session_label: String,
     pub session_kind: SessionKind,
     pub branch_name: Option<String>,
+    pub last_activity_at: DateTime<Utc>,
+    pub is_stale: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterruptionItem {
+    pub request: AgentRequest,
+    pub issue: Issue,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DispatchSummary {
+    pub total_children: usize,
+    pub todo_count: usize,
+    pub ready_count: usize,
+    pub running_count: usize,
+    pub waiting_count: usize,
+    pub review_count: usize,
+    pub done_count: usize,
+    pub archived_count: usize,
+    pub open_request_count: usize,
+}
+
+impl DispatchSummary {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record_issue(&mut self, issue: &Issue, open_requests: usize) {
+        self.total_children += 1;
+        self.open_request_count += open_requests;
+        if issue.is_archived {
+            self.archived_count += 1;
+        }
+        match issue.status {
+            IssueStatus::Todo => self.todo_count += 1,
+            IssueStatus::ReadyForAgent => self.ready_count += 1,
+            IssueStatus::AgentRunning => self.running_count += 1,
+            IssueStatus::NeedsHumanInput | IssueStatus::Blocked => self.waiting_count += 1,
+            IssueStatus::NeedsReview => self.review_count += 1,
+            IssueStatus::Done => self.done_count += 1,
+        }
+    }
+
+    pub fn compact_label(&self) -> String {
+        format!(
+            "{} child{} | ready {} | running {} | review {} | waiting {} | done {}{}",
+            self.total_children,
+            if self.total_children == 1 { "" } else { "ren" },
+            self.ready_count,
+            self.running_count,
+            self.review_count,
+            self.waiting_count,
+            self.done_count,
+            if self.open_request_count > 0 {
+                format!(" | req {}", self.open_request_count)
+            } else {
+                String::new()
+            }
+        )
+    }
 }
 
 impl App {
@@ -264,10 +342,18 @@ impl App {
             run_events: Vec::new(),
             artifacts: Vec::new(),
             handoffs: Vec::new(),
+            subissues: Vec::new(),
+            agent_requests: Vec::new(),
+            interruptions: Vec::new(),
             active_work_context: None,
             active_session_link: None,
             agent_roster: Vec::new(),
+            dispatch_summaries: HashMap::new(),
             needs_human_count: 0,
+            stale_agent_count: 0,
+            open_agent_request_count: 0,
+            parallel_parent_count: 0,
+            parallel_subissue_count: 0,
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -283,7 +369,10 @@ impl App {
     }
 
     pub fn current_issue(&self) -> Option<&Issue> {
-        if self.saved_view == SavedView::Scratch {
+        if matches!(
+            self.saved_view,
+            SavedView::Scratch | SavedView::Interruptions
+        ) {
             return None;
         }
         self.issues.get(self.selected)
@@ -294,6 +383,13 @@ impl App {
             return None;
         }
         self.scratch_items.get(self.selected)
+    }
+
+    pub fn current_interruption(&self) -> Option<&InterruptionItem> {
+        if self.saved_view != SavedView::Interruptions {
+            return None;
+        }
+        self.interruptions.get(self.selected)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -311,6 +407,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
             KeyCode::Char('n') => self.begin_create_editor(),
             KeyCode::Char('e') => self.begin_edit_editor(),
+            KeyCode::Char('D') => self.begin_dispatch_editor(),
+            KeyCode::Char('R') => self.begin_agent_request_editor(),
+            KeyCode::Char('Q') => self.resolve_latest_agent_request()?,
+            KeyCode::Char('P') => self.jump_to_parent_issue()?,
+            KeyCode::Char('C') => self.jump_to_next_graph_issue()?,
+            KeyCode::Char('V') => self.approve_review_children()?,
+            KeyCode::Char('J') => self.requeue_stalled_children()?,
             KeyCode::Char('x') => self.begin_scratch_editor(),
             KeyCode::Char('i') => self.promote_selected_scratch()?,
             KeyCode::Char('s') => self.cycle_status()?,
@@ -338,6 +441,7 @@ impl App {
             KeyCode::Char('4') => self.set_saved_view(SavedView::Waiting),
             KeyCode::Char('5') => self.set_saved_view(SavedView::Done),
             KeyCode::Char('6') => self.set_saved_view(SavedView::Scratch),
+            KeyCode::Char('7') => self.set_saved_view(SavedView::Interruptions),
             KeyCode::Char('?') => self.toggle_help(),
             KeyCode::Char('y') => self.sync_now()?,
             KeyCode::Char('r') => self.retry_failed_sync()?,
@@ -448,6 +552,68 @@ impl App {
             follow_up_needed: issue.follow_up_needed,
         });
         self.status_message = format!("Editing {}", issue.identifier);
+    }
+
+    pub fn begin_dispatch_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected to dispatch".into();
+            return;
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::DispatchSubissue {
+                parent_local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: format!("{} / subtask", issue.title),
+            title_cursor: format!("{} / subtask", issue.title).chars().count(),
+            description: String::new(),
+            description_cursor: 0,
+            project: "ready_for_agent".into(),
+            project_cursor: "ready_for_agent".chars().count(),
+            labels: String::new(),
+            labels_cursor: 0,
+            assignee: String::new(),
+            assignee_cursor: 0,
+            status: IssueStatus::ReadyForAgent,
+            priority: issue.priority,
+            search: String::new(),
+            search_cursor: 0,
+            scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
+        });
+        self.status_message =
+            "Dispatch a sub-issue. Fields are title, description, initial status.".into();
+    }
+
+    pub fn begin_agent_request_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected for agent request".into();
+            return;
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::AgentRequest {
+                issue_local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: "Need human decision".into(),
+            title_cursor: "Need human decision".chars().count(),
+            description: String::new(),
+            description_cursor: 0,
+            project: "question".into(),
+            project_cursor: "question".chars().count(),
+            labels: String::new(),
+            labels_cursor: 0,
+            assignee: String::new(),
+            assignee_cursor: 0,
+            status: IssueStatus::NeedsHumanInput,
+            priority: issue.priority,
+            search: String::new(),
+            search_cursor: 0,
+            scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
+        });
+        self.status_message =
+            "Create a structured agent request. Fields are title, body, kind.".into();
     }
 
     pub fn begin_search_editor(&mut self) {
@@ -987,11 +1153,38 @@ impl App {
 
     fn reload(&mut self) -> Result<()> {
         let issues = self.store.list_issues(&self.query)?;
+        let all_dispatch_issues = self.store.list_issues(&IssueQuery {
+            include_archived: true,
+            ..IssueQuery::default()
+        })?;
         self.needs_human_count = issues
             .iter()
             .filter(|issue| issue_needs_human_attention(issue))
             .count();
+        self.open_agent_request_count = issues.iter().try_fold(0usize, |acc, issue| {
+            Ok::<usize, anyhow::Error>(
+                acc + self
+                    .store
+                    .list_agent_requests_for_issue(issue.local_id)?
+                    .into_iter()
+                    .filter(|request| request.status == AgentRequestStatus::Open)
+                    .count(),
+            )
+        })?;
         self.agent_roster = self.build_agent_roster(&issues)?;
+        self.stale_agent_count = self
+            .agent_roster
+            .iter()
+            .filter(|entry| entry.is_stale)
+            .count();
+        self.dispatch_summaries = self.build_dispatch_summaries(&all_dispatch_issues)?;
+        self.parallel_parent_count = self.dispatch_summaries.len();
+        self.parallel_subissue_count = self
+            .dispatch_summaries
+            .values()
+            .map(|summary| summary.total_children)
+            .sum();
+        self.interruptions = self.build_interruption_queue(&issues)?;
         self.issues = self.filter_issues_for_view(issues);
         self.scratch_items = self.store.list_scratch_items()?;
         self.refresh_activity()?;
@@ -1152,6 +1345,94 @@ impl App {
                 self.reload()?;
                 self.select_issue(issue.local_id);
                 self.status_message = format!("Created {}", issue.identifier);
+            }
+            EditorMode::DispatchSubissue { parent_local_id } => {
+                let title = if editor.title.trim().is_empty() {
+                    "Dispatched subtask".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                let description = if editor.description.trim().is_empty() {
+                    "Subtask dispatched from parent issue.".to_string()
+                } else {
+                    editor.description.trim().to_string()
+                };
+                let kind_status = match editor.project.trim() {
+                    "todo" => IssueStatus::Todo,
+                    "agent_running" => IssueStatus::AgentRunning,
+                    "needs_review" => IssueStatus::NeedsReview,
+                    "blocked" => IssueStatus::Blocked,
+                    _ => IssueStatus::ReadyForAgent,
+                };
+                let mut draft = IssueDraft::new(title, description);
+                draft.parent_id = Some(parent_local_id);
+                draft.status = kind_status.clone();
+                draft.priority = editor.priority;
+                draft.owner_type = if matches!(
+                    kind_status,
+                    IssueStatus::ReadyForAgent | IssueStatus::AgentRunning
+                ) {
+                    OwnerType::Agent
+                } else {
+                    OwnerType::Unassigned
+                };
+                draft.attention_reason = Some(format!("dispatched from LOCAL-{parent_local_id}"));
+                let issue = self.store.create_issue(&draft)?;
+                self.saved_view = preferred_view_for_status(issue.status.clone());
+                self.reload()?;
+                self.select_issue(issue.local_id);
+                self.status_message = format!("Dispatched sub-issue {}", issue.identifier);
+            }
+            EditorMode::AgentRequest { issue_local_id } => {
+                let kind = match editor.project.trim() {
+                    "review" => AgentRequestKind::Review,
+                    "blocker" => AgentRequestKind::Blocker,
+                    _ => AgentRequestKind::Question,
+                };
+                let title = if editor.title.trim().is_empty() {
+                    "Need human input".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                let body = if editor.description.trim().is_empty() {
+                    "No extra context provided.".to_string()
+                } else {
+                    editor.description.trim().to_string()
+                };
+                let requested_by = self
+                    .active_session_link
+                    .as_ref()
+                    .map(|session| session.label.clone())
+                    .unwrap_or_else(|| "agent".into());
+                let _request = self.store.create_agent_request(
+                    issue_local_id,
+                    kind.clone(),
+                    &title,
+                    &body,
+                    &requested_by,
+                )?;
+                let mut patch = IssuePatch::empty();
+                patch.status = Some(match kind {
+                    AgentRequestKind::Review => IssueStatus::NeedsReview,
+                    AgentRequestKind::Blocker => IssueStatus::Blocked,
+                    AgentRequestKind::Question => IssueStatus::NeedsHumanInput,
+                });
+                patch.attention_reason =
+                    Some(Some(format!("agent request: {}", title.to_lowercase())));
+                if matches!(kind, AgentRequestKind::Blocker) {
+                    patch.blocked_reason = Some(Some(title.clone()));
+                }
+                let issue = self.store.update_issue(issue_local_id, &patch)?;
+                self.store.create_handoff(
+                    issue_local_id,
+                    requested_by.as_str(),
+                    "human",
+                    &format!("Agent request opened: {title}"),
+                )?;
+                self.saved_view = preferred_view_for_status(issue.status.clone());
+                self.reload()?;
+                self.select_issue(issue.local_id);
+                self.status_message = format!("Opened agent request on {}", issue.identifier);
             }
             EditorMode::Edit { local_id } => {
                 let Some(existing) = self.store.get_issue(local_id)? else {
@@ -1322,6 +1603,8 @@ impl App {
         self.query.archived_only = false;
         if matches!(view, SavedView::Scratch) {
             self.status_message = "Switched to scratch inbox".into();
+        } else if matches!(view, SavedView::Interruptions) {
+            self.status_message = "Switched to interruption queue".into();
         } else if matches!(view, SavedView::Done) {
             self.status_message = "Switched to done issues".into();
         } else if matches!(view, SavedView::Inbox) {
@@ -1343,6 +1626,21 @@ impl App {
             self.selected = index;
             let _ = self.refresh_activity();
         }
+    }
+
+    fn focus_issue_any_view(&mut self, local_id: i64) -> Result<()> {
+        let Some(issue) = self.store.get_issue(local_id)? else {
+            self.status_message = "Target issue no longer exists".into();
+            return Ok(());
+        };
+
+        self.saved_view = preferred_view_for_status(issue.status.clone());
+        self.query.unsynced_only = false;
+        self.query.archived_only = false;
+        self.query.include_archived = issue.is_archived;
+        self.reload()?;
+        self.select_issue(local_id);
+        Ok(())
     }
 
     fn select_scratch(&mut self, scratch_id: i64) {
@@ -1381,19 +1679,24 @@ impl App {
             .filter(|issue| issue.sync_state == SyncState::SyncError)
             .count();
         format!(
-            "queue: {} | pending: {} | errors: {} | scratch: {}",
+            "queue: {} | pending: {} | errors: {} | scratch: {} | open-requests: {}",
             self.queued_mutation_count,
             pending,
             errors,
             self.scratch_items
                 .iter()
                 .filter(|item| item.promoted_issue_id.is_none())
-                .count()
+                .count(),
+            self.open_agent_request_count
         )
     }
 
     pub fn is_scratch_view(&self) -> bool {
         self.saved_view == SavedView::Scratch
+    }
+
+    pub fn is_interruptions_view(&self) -> bool {
+        self.saved_view == SavedView::Interruptions
     }
 
     pub fn list_title(&self) -> &'static str {
@@ -1404,6 +1707,7 @@ impl App {
             SavedView::Waiting => "Waiting",
             SavedView::Done => "Done",
             SavedView::Scratch => "Scratch",
+            SavedView::Interruptions => "Interruptions",
         }
     }
 
@@ -1414,16 +1718,58 @@ impl App {
             .filter(|entry| entry.session_kind == SessionKind::AgentSession)
             .count();
         format!(
-            "needs-human: {} | active-agents: {} | roster: {}",
+            "needs-human: {} | active-agents: {} | stale-agents: {} | parallel: {} parent / {} child | roster: {}",
             self.needs_human_count,
             agents_running,
+            self.stale_agent_count,
+            self.parallel_parent_count,
+            self.parallel_subissue_count,
             self.agent_roster.len()
         )
+    }
+
+    pub fn dispatch_summary_for_issue(&self, local_id: i64) -> Option<&DispatchSummary> {
+        self.dispatch_summaries.get(&local_id)
+    }
+
+    pub fn parallel_context_summary(&self, issue: &Issue) -> Option<String> {
+        if let Some(summary) = self.dispatch_summary_for_issue(issue.local_id) {
+            return Some(format!("dispatch owner | {}", summary.compact_label()));
+        }
+        if let Some(parent_id) = issue.parent_id {
+            if let Some(summary) = self.dispatch_summary_for_issue(parent_id) {
+                return Some(format!(
+                    "child of LOCAL-{} | sibling graph: {}",
+                    parent_id,
+                    summary.compact_label()
+                ));
+            }
+            return Some(format!("child of LOCAL-{parent_id}"));
+        }
+        None
+    }
+
+    pub fn issue_is_stale(&self, local_id: i64) -> bool {
+        self.agent_roster
+            .iter()
+            .any(|entry| entry.issue_local_id == local_id && entry.is_stale)
+    }
+
+    pub fn graph_navigation_hint(&self, issue: &Issue) -> Option<String> {
+        if let Some(parent_id) = issue.parent_id {
+            return Some(format!("P parent LOCAL-{parent_id} | C next sibling"));
+        }
+        if self.dispatch_summary_for_issue(issue.local_id).is_some() {
+            return Some("C next child needing attention".into());
+        }
+        None
     }
 
     fn visible_len(&self) -> usize {
         if self.saved_view == SavedView::Scratch {
             self.scratch_items.len()
+        } else if self.saved_view == SavedView::Interruptions {
+            self.interruptions.len()
         } else {
             self.issues.len()
         }
@@ -1449,6 +1795,7 @@ impl App {
                 }
                 SavedView::Done => issue.status == IssueStatus::Done,
                 SavedView::Scratch => false,
+                SavedView::Interruptions => false,
             })
             .collect()
     }
@@ -1511,16 +1858,235 @@ impl App {
             self.run_events = self.store.list_run_events_for_issue(issue.local_id)?;
             self.artifacts = self.store.list_artifacts_for_issue(issue.local_id)?;
             self.handoffs = self.store.list_handoffs_for_issue(issue.local_id)?;
+            self.subissues = self.store.list_subissues(issue.local_id)?;
+            self.agent_requests = self.store.list_agent_requests_for_issue(issue.local_id)?;
             self.active_work_context = self.store.get_active_work_context(issue.local_id)?;
             self.active_session_link = self.store.get_active_session_link(issue.local_id)?;
+        } else if let Some(interruption) = self.current_interruption().cloned() {
+            self.runs = self
+                .store
+                .list_runs_for_issue(interruption.issue.local_id)?;
+            self.run_events = self
+                .store
+                .list_run_events_for_issue(interruption.issue.local_id)?;
+            self.artifacts = self
+                .store
+                .list_artifacts_for_issue(interruption.issue.local_id)?;
+            self.handoffs = self
+                .store
+                .list_handoffs_for_issue(interruption.issue.local_id)?;
+            self.subissues = self.store.list_subissues(interruption.issue.local_id)?;
+            self.agent_requests = self
+                .store
+                .list_agent_requests_for_issue(interruption.issue.local_id)?;
+            self.active_work_context = self
+                .store
+                .get_active_work_context(interruption.issue.local_id)?;
+            self.active_session_link = self
+                .store
+                .get_active_session_link(interruption.issue.local_id)?;
         } else {
             self.runs.clear();
             self.run_events.clear();
             self.artifacts.clear();
             self.handoffs.clear();
+            self.subissues.clear();
+            self.agent_requests.clear();
             self.active_work_context = None;
             self.active_session_link = None;
         }
+        Ok(())
+    }
+
+    fn resolve_latest_agent_request(&mut self) -> Result<()> {
+        if let Some(interruption) = self.current_interruption().cloned() {
+            let _ = self.store.resolve_agent_request(interruption.request.id)?;
+            self.store.create_handoff(
+                interruption.issue.local_id,
+                "human",
+                interruption.request.requested_by.as_str(),
+                &format!("Resolved interruption: {}", interruption.request.title),
+            )?;
+            self.reload()?;
+            self.status_message =
+                format!("Resolved interruption on {}", interruption.issue.identifier);
+            return Ok(());
+        }
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let open_request = self
+            .store
+            .list_agent_requests_for_issue(issue.local_id)?
+            .into_iter()
+            .find(|request| request.status == AgentRequestStatus::Open);
+        let Some(request) = open_request else {
+            self.status_message = "No open agent request to resolve".into();
+            return Ok(());
+        };
+        let _ = self.store.resolve_agent_request(request.id)?;
+        self.store.create_handoff(
+            issue.local_id,
+            "human",
+            request.requested_by.as_str(),
+            &format!("Resolved agent request: {}", request.title),
+        )?;
+        self.reload()?;
+        self.select_issue(issue.local_id);
+        self.status_message = format!("Resolved request on {}", issue.identifier);
+        Ok(())
+    }
+
+    fn jump_to_parent_issue(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let Some(parent_id) = issue.parent_id else {
+            self.status_message = "Selected issue is already the graph root".into();
+            return Ok(());
+        };
+        self.focus_issue_any_view(parent_id)?;
+        self.status_message = format!("Jumped to parent LOCAL-{parent_id}");
+        Ok(())
+    }
+
+    fn jump_to_next_graph_issue(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+
+        if issue.parent_id.is_none() {
+            let children = self.store.list_subissues(issue.local_id)?;
+            if children.is_empty() {
+                self.status_message = "No dispatched children to jump into".into();
+                return Ok(());
+            }
+            let target = children
+                .into_iter()
+                .min_by_key(graph_issue_sort_key)
+                .expect("children already checked as non-empty");
+            self.focus_issue_any_view(target.local_id)?;
+            self.status_message = format!("Jumped to child {}", target.identifier);
+            return Ok(());
+        }
+
+        let parent_id = issue.parent_id.expect("child issue should have parent");
+        let siblings = self.store.list_subissues(parent_id)?;
+        if siblings.len() <= 1 {
+            self.status_message = "No sibling issues in this dispatch graph".into();
+            return Ok(());
+        }
+
+        let mut ordered = siblings;
+        ordered.sort_by_key(graph_issue_sort_key);
+        let Some(current_index) = ordered
+            .iter()
+            .position(|candidate| candidate.local_id == issue.local_id)
+        else {
+            self.status_message = "Current issue is missing from its sibling graph".into();
+            return Ok(());
+        };
+        let next_index = (current_index + 1) % ordered.len();
+        let target = ordered[next_index].clone();
+        self.focus_issue_any_view(target.local_id)?;
+        self.status_message = format!("Jumped to sibling {}", target.identifier);
+        Ok(())
+    }
+
+    fn approve_review_children(&mut self) -> Result<()> {
+        let Some(parent) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let children = self.store.list_subissues(parent.local_id)?;
+        if children.is_empty() {
+            self.status_message = "No child issues in this dispatch graph".into();
+            return Ok(());
+        }
+
+        let mut approved = 0usize;
+        for child in children
+            .into_iter()
+            .filter(|child| child.status == IssueStatus::NeedsReview)
+        {
+            let mut patch = IssuePatch::empty();
+            patch.status = Some(IssueStatus::Done);
+            patch.attention_reason = Some(Some("approved from parent dispatch graph".into()));
+            patch.owner_type = Some(OwnerType::Human);
+            patch.owner_name = Some(Some("reviewer".into()));
+            patch.blocked_reason = Some(None);
+            self.store.update_issue(child.local_id, &patch)?;
+            for request in self
+                .store
+                .list_agent_requests_for_issue(child.local_id)?
+                .into_iter()
+                .filter(|request| {
+                    request.status == AgentRequestStatus::Open
+                        && request.kind == AgentRequestKind::Review
+                })
+            {
+                let _ = self.store.resolve_agent_request(request.id)?;
+            }
+            self.store.create_handoff(
+                child.local_id,
+                "review",
+                "done",
+                "Approved from parent dispatch graph",
+            )?;
+            approved += 1;
+        }
+
+        if approved == 0 {
+            self.status_message = "No review-ready child issues to approve".into();
+            return Ok(());
+        }
+
+        self.reload()?;
+        self.select_issue(parent.local_id);
+        self.status_message = format!("Approved {approved} child issue(s) from graph");
+        Ok(())
+    }
+
+    fn requeue_stalled_children(&mut self) -> Result<()> {
+        let Some(parent) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let children = self.store.list_subissues(parent.local_id)?;
+        if children.is_empty() {
+            self.status_message = "No child issues in this dispatch graph".into();
+            return Ok(());
+        }
+
+        let mut requeued = 0usize;
+        for child in children.into_iter().filter(|child| {
+            matches!(
+                child.status,
+                IssueStatus::Todo | IssueStatus::NeedsHumanInput | IssueStatus::Blocked
+            )
+        }) {
+            let mut patch = IssuePatch::empty();
+            patch.status = Some(IssueStatus::ReadyForAgent);
+            patch.owner_type = Some(OwnerType::Agent);
+            patch.owner_name = Some(Some("agent".into()));
+            patch.attention_reason = Some(Some("requeued from parent dispatch graph".into()));
+            patch.blocked_reason = Some(None);
+            self.store.update_issue(child.local_id, &patch)?;
+            self.store.create_handoff(
+                child.local_id,
+                "parent graph",
+                "agent",
+                "Requeued from parent dispatch graph",
+            )?;
+            requeued += 1;
+        }
+
+        if requeued == 0 {
+            self.status_message = "No stalled child issues to requeue".into();
+            return Ok(());
+        }
+
+        self.reload()?;
+        self.select_issue(parent.local_id);
+        self.status_message = format!("Requeued {requeued} child issue(s) to agents");
         Ok(())
     }
 
@@ -1613,19 +2179,76 @@ impl App {
         }) {
             let active_session = self.store.get_active_session_link(issue.local_id)?;
             let active_context = self.store.get_active_work_context(issue.local_id)?;
+            let active_run = self.store.latest_active_run_for_issue(issue.local_id)?;
             if let Some(session) = active_session {
+                let session_kind = session.session_kind.clone();
+                let last_activity_at = latest_activity_at(
+                    issue.updated_at,
+                    Some(session.last_heartbeat_at),
+                    active_context.as_ref().map(|ctx| ctx.updated_at),
+                    active_run
+                        .as_ref()
+                        .map(|run| run.ended_at.unwrap_or(run.started_at)),
+                );
                 roster.push(AgentRosterEntry {
+                    issue_local_id: issue.local_id,
                     identifier: issue.identifier.clone(),
                     session_label: session.label,
-                    session_kind: session.session_kind,
+                    session_kind: session_kind.clone(),
                     branch_name: active_context
                         .as_ref()
                         .and_then(|ctx| ctx.branch_name.clone()),
+                    last_activity_at,
+                    is_stale: is_stale_agent(
+                        session_kind,
+                        issue.status.clone(),
+                        last_activity_at,
+                        Utc::now(),
+                    ),
                 });
             }
         }
         roster.sort_by(|left, right| left.identifier.cmp(&right.identifier));
         Ok(roster)
+    }
+
+    fn build_dispatch_summaries(&self, issues: &[Issue]) -> Result<HashMap<i64, DispatchSummary>> {
+        let mut summaries = HashMap::new();
+        for issue in issues.iter().filter(|issue| issue.parent_id.is_some()) {
+            let Some(parent_id) = issue.parent_id else {
+                continue;
+            };
+            let open_requests = self
+                .store
+                .list_agent_requests_for_issue(issue.local_id)?
+                .into_iter()
+                .filter(|request| request.status == AgentRequestStatus::Open)
+                .count();
+            summaries
+                .entry(parent_id)
+                .or_insert_with(DispatchSummary::new)
+                .record_issue(issue, open_requests);
+        }
+        Ok(summaries)
+    }
+
+    fn build_interruption_queue(&self, issues: &[Issue]) -> Result<Vec<InterruptionItem>> {
+        let mut queue = Vec::new();
+        for issue in issues {
+            for request in self
+                .store
+                .list_agent_requests_for_issue(issue.local_id)?
+                .into_iter()
+                .filter(|request| request.status == AgentRequestStatus::Open)
+            {
+                queue.push(InterruptionItem {
+                    request,
+                    issue: issue.clone(),
+                });
+            }
+        }
+        queue.sort_by(|left, right| right.request.created_at.cmp(&left.request.created_at));
+        Ok(queue)
     }
 }
 
@@ -1637,6 +2260,7 @@ pub enum SavedView {
     Waiting,
     Done,
     Scratch,
+    Interruptions,
 }
 
 impl SavedView {
@@ -1648,6 +2272,7 @@ impl SavedView {
             Self::Waiting => "waiting",
             Self::Done => "done",
             Self::Scratch => "scratch",
+            Self::Interruptions => "interruptions",
         }
     }
 }
@@ -1669,6 +2294,66 @@ fn preferred_view_for_status(status: IssueStatus) -> SavedView {
         IssueStatus::Blocked => SavedView::Waiting,
         IssueStatus::Done => SavedView::Done,
         IssueStatus::Todo | IssueStatus::NeedsHumanInput => SavedView::Inbox,
+    }
+}
+
+fn graph_issue_sort_key(issue: &Issue) -> (u8, String) {
+    (graph_issue_rank(&issue.status), issue.identifier.clone())
+}
+
+fn graph_issue_rank(status: &IssueStatus) -> u8 {
+    match status {
+        IssueStatus::NeedsHumanInput => 0,
+        IssueStatus::Blocked => 1,
+        IssueStatus::NeedsReview => 2,
+        IssueStatus::Todo => 3,
+        IssueStatus::ReadyForAgent => 4,
+        IssueStatus::AgentRunning => 5,
+        IssueStatus::Done => 6,
+    }
+}
+
+fn latest_activity_at(
+    issue_updated_at: DateTime<Utc>,
+    session_at: Option<DateTime<Utc>>,
+    context_at: Option<DateTime<Utc>>,
+    run_at: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    [Some(issue_updated_at), session_at, context_at, run_at]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(issue_updated_at)
+}
+
+fn is_stale_agent(
+    session_kind: SessionKind,
+    issue_status: IssueStatus,
+    last_activity_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    if session_kind != SessionKind::AgentSession {
+        return false;
+    }
+    if !matches!(
+        issue_status,
+        IssueStatus::ReadyForAgent | IssueStatus::AgentRunning | IssueStatus::NeedsReview
+    ) {
+        return false;
+    }
+    now.signed_duration_since(last_activity_at) >= Duration::minutes(30)
+}
+
+pub(crate) fn relative_age_label(last_activity_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let age = now.signed_duration_since(last_activity_at);
+    if age < Duration::minutes(1) {
+        "just now".into()
+    } else if age < Duration::hours(1) {
+        format!("{}m ago", age.num_minutes())
+    } else if age < Duration::days(1) {
+        format!("{}h ago", age.num_hours())
+    } else {
+        format!("{}d ago", age.num_days())
     }
 }
 
@@ -1915,12 +2600,20 @@ mod tests {
             run_events: Vec::new(),
             artifacts: Vec::new(),
             handoffs: Vec::new(),
+            subissues: Vec::new(),
+            agent_requests: Vec::new(),
+            interruptions: Vec::new(),
             active_work_context: None,
             active_session_link: None,
             selected: 0,
             query: IssueQuery::default(),
             agent_roster: Vec::new(),
+            dispatch_summaries: HashMap::new(),
             needs_human_count: 0,
+            stale_agent_count: 0,
+            open_agent_request_count: 0,
+            parallel_parent_count: 0,
+            parallel_subissue_count: 0,
             saved_view: SavedView::Inbox,
             status_message: String::new(),
             queued_mutation_count: 0,
@@ -2339,5 +3032,347 @@ mod tests {
             Some("feature/test".into())
         );
         assert_eq!(normalize_command_output(" \n\t "), None);
+    }
+
+    #[test]
+    fn agent_sessions_become_stale_after_threshold() {
+        let now = Utc::now();
+        assert!(is_stale_agent(
+            SessionKind::AgentSession,
+            IssueStatus::AgentRunning,
+            now - Duration::minutes(45),
+            now
+        ));
+        assert!(!is_stale_agent(
+            SessionKind::AgentSession,
+            IssueStatus::AgentRunning,
+            now - Duration::minutes(5),
+            now
+        ));
+        assert!(!is_stale_agent(
+            SessionKind::HumanTerminal,
+            IssueStatus::AgentRunning,
+            now - Duration::minutes(45),
+            now
+        ));
+    }
+
+    #[test]
+    fn relative_age_label_formats_recent_and_older_activity() {
+        let now = Utc::now();
+        assert_eq!(relative_age_label(now, now), "just now");
+        assert_eq!(
+            relative_age_label(now - Duration::minutes(12), now),
+            "12m ago"
+        );
+    }
+
+    #[test]
+    fn dispatch_editor_creates_subissue() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Parent", "Dispatch from here"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_dispatch_editor();
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))?;
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        for ch in "child".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        let subissues = app.store.list_subissues(issue.local_id)?;
+        assert_eq!(subissues.len(), 1);
+        assert_eq!(subissues[0].parent_id, Some(issue.local_id));
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_summaries_track_parallel_child_progress() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Parent graph", "Track parallel work"))?;
+
+        let mut ready = IssueDraft::new("Ready child", "Agent can pick this up");
+        ready.parent_id = Some(parent.local_id);
+        ready.status = IssueStatus::ReadyForAgent;
+        app.store.create_issue(&ready)?;
+
+        let mut review = IssueDraft::new("Review child", "Needs review");
+        review.parent_id = Some(parent.local_id);
+        review.status = IssueStatus::NeedsReview;
+        let review = app.store.create_issue(&review)?;
+        app.store.create_agent_request(
+            review.local_id,
+            AgentRequestKind::Review,
+            "Check output",
+            "Need a reviewer",
+            "worker-a",
+        )?;
+
+        let mut done = IssueDraft::new("Done child", "Already finished");
+        done.parent_id = Some(parent.local_id);
+        done.status = IssueStatus::Done;
+        app.store.create_issue(&done)?;
+
+        app.reload()?;
+
+        let summary = app
+            .dispatch_summary_for_issue(parent.local_id)
+            .expect("dispatch summary should exist");
+        assert_eq!(summary.total_children, 3);
+        assert_eq!(summary.ready_count, 1);
+        assert_eq!(summary.review_count, 1);
+        assert_eq!(summary.done_count, 1);
+        assert_eq!(summary.open_request_count, 1);
+        assert_eq!(app.parallel_parent_count, 1);
+        assert_eq!(app.parallel_subissue_count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_navigation_jumps_from_parent_to_most_actionable_child() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Parent nav", "Move through graph"))?;
+
+        let mut running = IssueDraft::new("Running child", "Still executing");
+        running.parent_id = Some(parent.local_id);
+        running.status = IssueStatus::AgentRunning;
+        let running = app.store.create_issue(&running)?;
+
+        let mut blocked = IssueDraft::new("Blocked child", "Needs attention first");
+        blocked.parent_id = Some(parent.local_id);
+        blocked.status = IssueStatus::Blocked;
+        let blocked = app.store.create_issue(&blocked)?;
+
+        app.reload()?;
+        app.select_issue(parent.local_id);
+
+        app.jump_to_next_graph_issue()?;
+
+        assert_eq!(
+            app.current_issue().map(|issue| issue.local_id),
+            Some(blocked.local_id)
+        );
+        assert_eq!(app.saved_view, SavedView::Waiting);
+        assert_ne!(running.local_id, blocked.local_id);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_navigation_jumps_to_parent_and_next_sibling() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Parent nav", "Move through graph"))?;
+
+        let mut first = IssueDraft::new("First child", "Sibling one");
+        first.parent_id = Some(parent.local_id);
+        first.status = IssueStatus::NeedsReview;
+        let first = app.store.create_issue(&first)?;
+
+        let mut second = IssueDraft::new("Second child", "Sibling two");
+        second.parent_id = Some(parent.local_id);
+        second.status = IssueStatus::Done;
+        let second = app.store.create_issue(&second)?;
+
+        app.focus_issue_any_view(first.local_id)?;
+        app.jump_to_parent_issue()?;
+        assert_eq!(
+            app.current_issue().map(|issue| issue.local_id),
+            Some(parent.local_id)
+        );
+
+        app.focus_issue_any_view(first.local_id)?;
+        app.jump_to_next_graph_issue()?;
+        assert_eq!(
+            app.current_issue().map(|issue| issue.local_id),
+            Some(second.local_id)
+        );
+        assert_eq!(app.saved_view, SavedView::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn parent_graph_can_approve_review_children() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Parent approve", "Review everything here"))?;
+
+        let mut review = IssueDraft::new("Review child", "Needs sign-off");
+        review.parent_id = Some(parent.local_id);
+        review.status = IssueStatus::NeedsReview;
+        let review = app.store.create_issue(&review)?;
+        app.store.create_agent_request(
+            review.local_id,
+            AgentRequestKind::Review,
+            "Please review",
+            "Looks good from the worker side",
+            "worker-a",
+        )?;
+
+        let mut waiting = IssueDraft::new("Blocked child", "Should stay blocked");
+        waiting.parent_id = Some(parent.local_id);
+        waiting.status = IssueStatus::Blocked;
+        let waiting = app.store.create_issue(&waiting)?;
+
+        app.reload()?;
+        app.select_issue(parent.local_id);
+
+        app.approve_review_children()?;
+
+        let review = app
+            .store
+            .get_issue(review.local_id)?
+            .expect("review child missing");
+        let waiting = app
+            .store
+            .get_issue(waiting.local_id)?
+            .expect("waiting child missing");
+        assert_eq!(review.status, IssueStatus::Done);
+        assert_eq!(
+            review.attention_reason.as_deref(),
+            Some("approved from parent dispatch graph")
+        );
+        assert_eq!(waiting.status, IssueStatus::Blocked);
+        assert!(
+            app.store
+                .list_agent_requests_for_issue(review.local_id)?
+                .into_iter()
+                .all(|request| request.status == AgentRequestStatus::Resolved)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parent_graph_can_requeue_stalled_children() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app.store.create_issue(&IssueDraft::new(
+            "Parent requeue",
+            "Send stalled work back out",
+        ))?;
+
+        let mut todo = IssueDraft::new("Todo child", "Should requeue");
+        todo.parent_id = Some(parent.local_id);
+        todo.status = IssueStatus::Todo;
+        let todo = app.store.create_issue(&todo)?;
+
+        let mut blocked = IssueDraft::new("Blocked child", "Should requeue");
+        blocked.parent_id = Some(parent.local_id);
+        blocked.status = IssueStatus::Blocked;
+        blocked.blocked_reason = Some("needs retry".into());
+        let blocked = app.store.create_issue(&blocked)?;
+
+        let mut running = IssueDraft::new("Running child", "Should stay running");
+        running.parent_id = Some(parent.local_id);
+        running.status = IssueStatus::AgentRunning;
+        let running = app.store.create_issue(&running)?;
+
+        app.reload()?;
+        app.select_issue(parent.local_id);
+
+        app.requeue_stalled_children()?;
+
+        let todo = app
+            .store
+            .get_issue(todo.local_id)?
+            .expect("todo child missing");
+        let blocked = app
+            .store
+            .get_issue(blocked.local_id)?
+            .expect("blocked child missing");
+        let running = app
+            .store
+            .get_issue(running.local_id)?
+            .expect("running child missing");
+        assert_eq!(todo.status, IssueStatus::ReadyForAgent);
+        assert_eq!(blocked.status, IssueStatus::ReadyForAgent);
+        assert_eq!(blocked.blocked_reason, None);
+        assert_eq!(todo.owner_type, OwnerType::Agent);
+        assert_eq!(running.status, IssueStatus::AgentRunning);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_request_flow_creates_and_resolves_request() -> Result<()> {
+        let mut app = test_app()?;
+        let mut issue = IssueDraft::new("Agent task", "Need a structured interruption");
+        issue.status = IssueStatus::AgentRunning;
+        issue.owner_type = OwnerType::Agent;
+        let issue = app.store.create_issue(&issue)?;
+        app.reload()?;
+        app.set_saved_view(SavedView::Running);
+        app.select_issue(issue.local_id);
+
+        app.begin_agent_request_editor();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for ch in "Need approval".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.project.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "review".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        assert_eq!(app.agent_requests.len(), 1);
+        assert_eq!(app.agent_requests[0].status, AgentRequestStatus::Open);
+
+        app.resolve_latest_agent_request()?;
+        assert_eq!(app.agent_requests[0].status, AgentRequestStatus::Resolved);
+        Ok(())
+    }
+
+    #[test]
+    fn interruption_queue_lists_open_requests_and_resolves_selected_item() -> Result<()> {
+        let mut app = test_app()?;
+        let mut issue = IssueDraft::new("Queue me", "Needs interruption queue coverage");
+        issue.status = IssueStatus::AgentRunning;
+        issue.owner_type = OwnerType::Agent;
+        let issue = app.store.create_issue(&issue)?;
+        app.store.create_agent_request(
+            issue.local_id,
+            AgentRequestKind::Question,
+            "Need a decision",
+            "Should we continue?",
+            "worker-a",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+
+        assert_eq!(app.interruptions.len(), 1);
+        assert_eq!(
+            app.current_interruption().map(|item| item.issue.local_id),
+            Some(issue.local_id)
+        );
+
+        app.resolve_latest_agent_request()?;
+
+        assert!(app.interruptions.is_empty());
+        assert!(
+            app.store
+                .list_agent_requests_for_issue(issue.local_id)?
+                .into_iter()
+                .all(|request| request.status == AgentRequestStatus::Resolved)
+        );
+        Ok(())
     }
 }

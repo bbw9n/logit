@@ -131,6 +131,7 @@ impl OwnerType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Issue {
     pub local_id: i64,
+    pub parent_id: Option<i64>,
     pub remote_id: Option<String>,
     pub identifier: String,
     pub title: String,
@@ -155,6 +156,7 @@ pub struct Issue {
 pub struct IssueDraft {
     pub title: String,
     pub description: String,
+    pub parent_id: Option<i64>,
     pub project: Option<String>,
     pub labels: Vec<String>,
     pub status: IssueStatus,
@@ -173,6 +175,7 @@ impl IssueDraft {
         Self {
             title: title.into(),
             description: description.into(),
+            parent_id: None,
             project: None,
             labels: Vec::new(),
             status: IssueStatus::Todo,
@@ -192,6 +195,7 @@ impl IssueDraft {
 pub struct IssuePatch {
     pub title: Option<String>,
     pub description: Option<String>,
+    pub parent_id: Option<Option<i64>>,
     pub project: Option<Option<String>>,
     pub labels: Option<Vec<String>>,
     pub status: Option<IssueStatus>,
@@ -211,6 +215,7 @@ impl IssuePatch {
         Self {
             title: None,
             description: None,
+            parent_id: None,
             project: None,
             labels: None,
             status: None,
@@ -272,6 +277,61 @@ pub struct HandoffRecord {
     pub to_actor: String,
     pub note: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentRequestKind {
+    Question,
+    Review,
+    Blocker,
+}
+
+impl AgentRequestKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Review => "review",
+            Self::Blocker => "blocker",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Review => "review",
+            Self::Blocker => "blocker",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentRequestStatus {
+    Open,
+    Resolved,
+    Dismissed,
+}
+
+impl AgentRequestStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRequest {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub kind: AgentRequestKind,
+    pub title: String,
+    pub body: String,
+    pub requested_by: String,
+    pub status: AgentRequestStatus,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

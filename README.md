@@ -14,6 +14,9 @@ What works today:
 - Local run tracking with run notes and evidence snippets
 - Active worktree and session context per issue
 - Git snapshot context on attached worktrees
+- Parent/sub-issue dispatch for parallel work
+- Parallel dispatch summaries for parent issues and sibling progress
+- Structured agent requests attached to issues
 - Closeout summaries with follow-up tracking
 - Handoff history and reopen flow
 - SQLite-backed persistence
@@ -21,6 +24,7 @@ What works today:
 - Project and label organization
 - Archive and restore flows
 - Saved views for inbox, running, review, waiting, done, and scratch work
+- Structured interruption queue for open agent requests
 - Default home screen centered on the inbox
 - Lightweight active-agent roster derived from session/worktree/run state
 - Offline mutation queue and tested sync boundary behavior
@@ -65,6 +69,13 @@ cargo test --locked
 
 - `n`: create a new issue
 - `e`: edit the selected issue
+- `D`: dispatch a sub-issue from the selected issue
+- `R`: open a structured agent request
+- `Q`: resolve the latest open agent request
+- `P`: jump from a child issue to its parent
+- `C`: move through the current dispatch graph
+- `V`: approve all review-ready child issues from a parent graph
+- `J`: requeue stalled child issues back to agents from a parent graph
 - `x`: capture a scratch item
 - `i`: promote the selected scratch item into a full issue
 - `Enter`: save the current modal
@@ -98,6 +109,7 @@ cargo test --locked
 - `4`: waiting view
 - `5`: done view
 - `6`: scratch view
+- `7`: interruption queue
 - `v`: toggle archived visibility in the current view
 - `/`: open search
 - `u`: clear search
@@ -149,6 +161,34 @@ When you start a run with `t`, `logit` now also tries to:
 - append a run note summarizing the current repo/branch/git snapshot/session context
 
 The inbox is intentionally human-attention-first: it prioritizes items in `todo`, `needs human input`, `needs review`, and `blocked`, while the sidebar shows a compact roster of active agent sessions and their current branches.
+
+## Agentic Control Loop
+
+`logit` now supports a tighter supervision loop for parallel work:
+
+- Dispatch:
+  - split a selected issue into a child sub-issue with `D`
+  - child issues keep a `parent_id` link so parallel work stays attached to the original outcome
+- Interrupt:
+  - raise a structured agent request with `R`
+  - requests can be `question`, `review`, or `blocker`
+  - requests update the parent issue’s attention state so they surface in the inbox/review/waiting views
+- Resolve:
+  - resolve the latest open request with `Q`
+  - request history stays attached to the issue for later review
+
+The detail pane shows parent/root status, dispatched sub-issues, and structured agent requests alongside runs, evidence, and handoffs.
+
+The inbox and sidebar also surface a compact parallel-work summary, so parent issues are easier to scan as coordination nodes rather than plain tasks.
+
+The interruption queue gives humans a dedicated place to process open agent questions, blockers, and review requests without relying on the currently selected issue.
+
+You can now move through a dispatch graph directly from the terminal:
+
+- `P` jumps from a child issue back to its parent/root
+- `C` jumps from a parent to the most actionable child, or from a child to the next sibling in the graph
+- `V` approves all review-ready children from the selected parent issue
+- `J` requeues stalled children (`todo`, `needs human input`, `blocked`) back to `ready for agent`
 
 ## Data Storage
 
@@ -209,6 +249,7 @@ The current test suite covers:
 - Run lifecycle, run notes, and evidence capture
 - Work context and session-link persistence
 - Git snapshot and run session-ref persistence
+- Parent/sub-issue and agent-request persistence
 - Closeout summaries and follow-up flags
 - Handoff history and reopen transitions
 - Mutation queue cleanup
