@@ -405,6 +405,16 @@ fn render_primary_detail(
                 issue.blocked_reason.as_deref().unwrap_or("none"),
                 palette,
             ),
+            meta_line(
+                "Closeout",
+                issue.closeout_summary.as_deref().unwrap_or("none"),
+                palette,
+            ),
+            meta_line(
+                "Follow Up",
+                if issue.follow_up_needed { "yes" } else { "no" },
+                palette,
+            ),
             meta_line("Sync", issue.sync_state.badge(), palette),
             meta_line(
                 "Remote",
@@ -423,6 +433,14 @@ fn render_primary_detail(
                 issue.description.clone(),
                 Style::default().fg(palette.soft),
             )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Context",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_context(app, palette),
             Line::from(""),
             Line::from(Span::styled(
                 "Runs",
@@ -445,6 +463,13 @@ fn render_primary_detail(
                     .add_modifier(Modifier::BOLD),
             )),
             timeline_line_for_artifacts(app, palette),
+            Line::from(Span::styled(
+                "Handoffs",
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            timeline_line_for_handoffs(app, palette),
         ])
     } else {
         Text::from(Span::styled(
@@ -512,6 +537,10 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("h / m / w / b", "agent / human / review / blocked", palette),
         key_line("t / g / z", "start / succeed / fail run", palette),
         key_line("l / o", "run note / evidence", palette),
+        key_line("c", "close with summary", palette),
+        key_line("O", "reopen from done", palette),
+        key_line("] / [", "attach worktree / session", palette),
+        key_line("} / {", "clear worktree / session", palette),
         key_line("a", "archive or restore", palette),
         key_line("v", "show archived", palette),
         key_line("1 / 2 / 3", "inbox / running / review", palette),
@@ -638,6 +667,13 @@ fn render_editor(frame: &mut Frame, app: &App, palette: Palette) {
                 palette,
             ),
         ),
+        EditorMode::WorkContext { .. } => {
+            (" Work Context ", work_context_editor_lines(editor, palette))
+        }
+        EditorMode::SessionLink { .. } => {
+            (" Session Link ", session_link_editor_lines(editor, palette))
+        }
+        EditorMode::Closeout { .. } => (" Closeout ", closeout_editor_lines(editor, palette)),
         EditorMode::Create => (
             " New Issue ",
             issue_editor_lines(
@@ -708,6 +744,12 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("z mark the latest active run as failed"),
         Line::from("l attach a note to the latest active run"),
         Line::from("o attach an evidence note to the selected issue"),
+        Line::from("c close the selected issue with a summary"),
+        Line::from("O reopen the selected issue into the inbox"),
+        Line::from("] attach repo/worktree/branch context"),
+        Line::from("[ attach session context"),
+        Line::from("} clear active work context"),
+        Line::from("{ clear active session link"),
         Line::from("a archive or restore selected issue"),
         Line::from("x capture scratch note"),
         Line::from("i promote selected scratch item"),
@@ -854,6 +896,119 @@ fn note_editor_lines(
             editor.focus,
             EditorFocus::Title,
             &editor.title,
+            palette,
+        ),
+    ]
+}
+
+fn closeout_editor_lines(editor: &crate::app::EditorState, palette: Palette) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Write a short closeout summary for why this work is done.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Enter saves. Esc cancels. Ctrl+F toggles follow-up.",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "summary",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            palette,
+        ),
+        Line::from(vec![
+            Span::styled("follow-up ", Style::default().fg(palette.title)),
+            badge(
+                if editor.follow_up_needed {
+                    "needed"
+                } else {
+                    "none"
+                },
+                palette.white,
+                if editor.follow_up_needed {
+                    palette.warn_bg
+                } else {
+                    palette.success_bg
+                },
+            ),
+        ]),
+    ]
+}
+
+fn work_context_editor_lines(
+    editor: &crate::app::EditorState,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Attach the current repo/worktree/branch context to this issue.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Fields: repo path, worktree path, branch name.",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "repo",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            palette,
+        ),
+        field_line(
+            "worktree",
+            editor.focus,
+            EditorFocus::Description,
+            &editor.description,
+            palette,
+        ),
+        field_line(
+            "branch",
+            editor.focus,
+            EditorFocus::Project,
+            &editor.project,
+            palette,
+        ),
+    ]
+}
+
+fn session_link_editor_lines(
+    editor: &crate::app::EditorState,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Attach a terminal or agent session to this issue.",
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            "Fields: label, kind, session ref.",
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(""),
+        field_line(
+            "label",
+            editor.focus,
+            EditorFocus::Title,
+            &editor.title,
+            palette,
+        ),
+        field_line(
+            "kind",
+            editor.focus,
+            EditorFocus::Description,
+            &editor.description,
+            palette,
+        ),
+        field_line(
+            "session ref",
+            editor.focus,
+            EditorFocus::Project,
+            &editor.project,
             palette,
         ),
     ]
@@ -1099,4 +1254,57 @@ fn timeline_line_for_artifacts(app: &App, palette: Palette) -> Line<'static> {
         .collect::<Vec<_>>()
         .join(" | ");
     Line::from(Span::styled(text, Style::default().fg(palette.soft)))
+}
+
+fn timeline_line_for_handoffs(app: &App, palette: Palette) -> Line<'static> {
+    if app.handoffs.is_empty() {
+        return Line::from(Span::styled(
+            "No handoffs yet",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    let text = app
+        .handoffs
+        .iter()
+        .take(3)
+        .map(|handoff| {
+            format!(
+                "{} -> {} ({})",
+                handoff.from_actor, handoff.to_actor, handoff.note
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Line::from(Span::styled(text, Style::default().fg(palette.soft)))
+}
+
+fn timeline_line_for_context(app: &App, palette: Palette) -> Line<'static> {
+    let mut parts = Vec::new();
+    if let Some(ctx) = &app.active_work_context {
+        parts.push(format!(
+            "repo={} branch={}",
+            ctx.repo_path,
+            ctx.branch_name.as_deref().unwrap_or("none")
+        ));
+        if let Some(worktree) = &ctx.worktree_path {
+            parts.push(format!("wt={worktree}"));
+        }
+    }
+    if let Some(session) = &app.active_session_link {
+        parts.push(format!(
+            "session={} [{}]",
+            session.label,
+            session.session_kind.label()
+        ));
+    }
+    if parts.is_empty() {
+        return Line::from(Span::styled(
+            "No active worktree or session context",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(Span::styled(
+        parts.join(" | "),
+        Style::default().fg(palette.soft),
+    ))
 }

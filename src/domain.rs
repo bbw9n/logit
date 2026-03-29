@@ -148,6 +148,8 @@ pub struct Issue {
     pub owner_name: Option<String>,
     pub attention_reason: Option<String>,
     pub blocked_reason: Option<String>,
+    pub closeout_summary: Option<String>,
+    pub follow_up_needed: bool,
     pub is_archived: bool,
     pub sync_state: SyncState,
     pub updated_at: DateTime<Utc>,
@@ -166,6 +168,8 @@ pub struct IssueDraft {
     pub owner_name: Option<String>,
     pub attention_reason: Option<String>,
     pub blocked_reason: Option<String>,
+    pub closeout_summary: Option<String>,
+    pub follow_up_needed: bool,
 }
 
 impl IssueDraft {
@@ -182,6 +186,8 @@ impl IssueDraft {
             owner_name: None,
             attention_reason: Some("new local task".into()),
             blocked_reason: None,
+            closeout_summary: None,
+            follow_up_needed: false,
         }
     }
 }
@@ -199,6 +205,8 @@ pub struct IssuePatch {
     pub owner_name: Option<Option<String>>,
     pub attention_reason: Option<Option<String>>,
     pub blocked_reason: Option<Option<String>>,
+    pub closeout_summary: Option<Option<String>>,
+    pub follow_up_needed: Option<bool>,
     pub is_archived: Option<bool>,
 }
 
@@ -216,6 +224,8 @@ impl IssuePatch {
             owner_name: None,
             attention_reason: None,
             blocked_reason: None,
+            closeout_summary: None,
+            follow_up_needed: None,
             is_archived: None,
         }
     }
@@ -256,6 +266,65 @@ pub struct ScratchItem {
     pub source: ScratchSource,
     pub created_at: DateTime<Utc>,
     pub promoted_issue_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandoffRecord {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub from_actor: String,
+    pub to_actor: String,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkContext {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub repo_path: String,
+    pub worktree_path: Option<String>,
+    pub branch_name: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionKind {
+    HumanTerminal,
+    AgentSession,
+    BackgroundJob,
+}
+
+impl SessionKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::HumanTerminal => "human terminal",
+            Self::AgentSession => "agent session",
+            Self::BackgroundJob => "background job",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::HumanTerminal => "human_terminal",
+            Self::AgentSession => "agent_session",
+            Self::BackgroundJob => "background_job",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionLink {
+    pub id: i64,
+    pub issue_local_id: i64,
+    pub session_ref: String,
+    pub session_kind: SessionKind,
+    pub label: String,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,7 +1,8 @@
 use crate::domain::{
-    ArtifactKind, ArtifactRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus,
-    OwnerType, Priority, QueuedMutation, QueuedMutationKind, RunEventLevel, RunEventRecord,
-    RunKind, RunRecord, RunStatus, ScratchItem, ScratchSource, SyncState,
+    ArtifactKind, ArtifactRecord, HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery,
+    IssueStatus, OwnerType, Priority, QueuedMutation, QueuedMutationKind, RunEventLevel,
+    RunEventRecord, RunKind, RunRecord, RunStatus, ScratchItem, ScratchSource, SessionKind,
+    SessionLink, SyncState, WorkContext,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -26,7 +27,7 @@ impl Store {
 
     pub fn list_issues(&self, query: &IssueQuery) -> Result<Vec<Issue>> {
         let mut sql = String::from(
-            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at
+            "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
              FROM issues WHERE 1 = 1",
         );
         let mut params = Vec::new();
@@ -68,7 +69,7 @@ impl Store {
     pub fn get_issue(&self, local_id: i64) -> Result<Option<Issue>> {
         self.conn
             .query_row(
-                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at
+                "SELECT local_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
                  FROM issues WHERE local_id = ?1",
                 [local_id],
                 map_issue_row,
@@ -217,6 +218,130 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn list_handoffs_for_issue(&self, issue_local_id: i64) -> Result<Vec<HandoffRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_local_id, from_actor, to_actor, note, created_at
+             FROM handoffs
+             WHERE issue_local_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 8",
+        )?;
+        let rows = stmt.query_map([issue_local_id], map_handoff_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_handoff(
+        &self,
+        issue_local_id: i64,
+        from_actor: &str,
+        to_actor: &str,
+        note: &str,
+    ) -> Result<HandoffRecord> {
+        self.conn.execute(
+            "INSERT INTO handoffs (issue_local_id, from_actor, to_actor, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                issue_local_id,
+                from_actor,
+                to_actor,
+                note,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_handoff(id)?
+            .context("created handoff missing from database")
+    }
+
+    pub fn get_active_work_context(&self, issue_local_id: i64) -> Result<Option<WorkContext>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at
+                 FROM work_contexts
+                 WHERE issue_local_id = ?1 AND is_active = 1
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 1",
+                [issue_local_id],
+                map_work_context_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_active_work_context(
+        &self,
+        issue_local_id: i64,
+        repo_path: &str,
+        worktree_path: Option<&str>,
+        branch_name: Option<&str>,
+    ) -> Result<WorkContext> {
+        self.clear_active_work_context(issue_local_id)?;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+            params![issue_local_id, repo_path, worktree_path, branch_name, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_work_context(id)?
+            .context("created work context missing from database")
+    }
+
+    pub fn clear_active_work_context(&self, issue_local_id: i64) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE work_contexts
+             SET is_active = 0, updated_at = ?2
+             WHERE issue_local_id = ?1 AND is_active = 1",
+            params![issue_local_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn get_active_session_link(&self, issue_local_id: i64) -> Result<Option<SessionLink>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, session_ref, session_kind, label, last_heartbeat_at, is_active, created_at
+                 FROM session_links
+                 WHERE issue_local_id = ?1 AND is_active = 1
+                 ORDER BY last_heartbeat_at DESC, id DESC
+                 LIMIT 1",
+                [issue_local_id],
+                map_session_link_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_active_session_link(
+        &self,
+        issue_local_id: i64,
+        session_ref: &str,
+        session_kind: SessionKind,
+        label: &str,
+    ) -> Result<SessionLink> {
+        self.clear_active_session_link(issue_local_id)?;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO session_links (issue_local_id, session_ref, session_kind, label, last_heartbeat_at, is_active, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?5)",
+            params![issue_local_id, session_ref, session_kind.code(), label, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_session_link(id)?
+            .context("created session link missing from database")
+    }
+
+    pub fn clear_active_session_link(&self, issue_local_id: i64) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE session_links
+             SET is_active = 0
+             WHERE issue_local_id = ?1 AND is_active = 1",
+            [issue_local_id],
+        )?;
+        Ok(updated)
+    }
+
     pub fn create_run(
         &self,
         issue_local_id: i64,
@@ -300,8 +425,8 @@ impl Store {
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at)
-             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, 'pending_create', ?12)",
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at)
+             VALUES (NULL, '', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 'pending_create', ?14)",
             params![
                 draft.title,
                 draft.description,
@@ -314,6 +439,8 @@ impl Store {
                 draft.owner_name,
                 draft.attention_reason,
                 draft.blocked_reason,
+                draft.closeout_summary,
+                if draft.follow_up_needed { 1 } else { 0 },
                 now.to_rfc3339()
             ],
         )?;
@@ -354,10 +481,12 @@ impl Store {
                  owner_name = ?9,
                  attention_reason = ?10,
                  blocked_reason = ?11,
-                 is_archived = ?12,
-                 sync_state = ?13,
-                 updated_at = ?14
-             WHERE local_id = ?15",
+                 closeout_summary = ?12,
+                 follow_up_needed = ?13,
+                 is_archived = ?14,
+                 sync_state = ?15,
+                 updated_at = ?16
+             WHERE local_id = ?17",
             params![
                 patch.title.as_deref().unwrap_or(&current.title),
                 patch.description.as_deref().unwrap_or(&current.description),
@@ -383,6 +512,15 @@ impl Store {
                     .blocked_reason
                     .clone()
                     .unwrap_or(current.blocked_reason.clone()),
+                patch
+                    .closeout_summary
+                    .clone()
+                    .unwrap_or(current.closeout_summary.clone()),
+                if patch.follow_up_needed.unwrap_or(current.follow_up_needed) {
+                    1
+                } else {
+                    0
+                },
                 patch.is_archived.unwrap_or(current.is_archived),
                 encode_sync_state(&next_sync_state),
                 Utc::now().to_rfc3339(),
@@ -504,6 +642,45 @@ impl Store {
             .map_err(Into::into)
     }
 
+    fn get_handoff(&self, id: i64) -> Result<Option<HandoffRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, from_actor, to_actor, note, created_at
+                 FROM handoffs
+                 WHERE id = ?1",
+                [id],
+                map_handoff_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_work_context(&self, id: i64) -> Result<Option<WorkContext>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at
+                 FROM work_contexts
+                 WHERE id = ?1",
+                [id],
+                map_work_context_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_session_link(&self, id: i64) -> Result<Option<SessionLink>> {
+        self.conn
+            .query_row(
+                "SELECT id, issue_local_id, session_ref, session_kind, label, last_heartbeat_at, is_active, created_at
+                 FROM session_links
+                 WHERE id = ?1",
+                [id],
+                map_session_link_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn mark_issue_synced(
         &self,
         local_id: i64,
@@ -587,6 +764,8 @@ impl Store {
                 owner_name TEXT,
                 attention_reason TEXT,
                 blocked_reason TEXT,
+                closeout_summary TEXT,
+                follow_up_needed INTEGER NOT NULL DEFAULT 0,
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 sync_state TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -636,6 +815,37 @@ impl Store {
                 content_preview TEXT NOT NULL,
                 location TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS handoffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                from_actor TEXT NOT NULL,
+                to_actor TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS work_contexts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                repo_path TEXT NOT NULL,
+                worktree_path TEXT,
+                branch_name TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_local_id INTEGER NOT NULL,
+                session_ref TEXT NOT NULL,
+                session_kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                last_heartbeat_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
             );",
         )?;
         let issue_columns = self.table_columns("issues")?;
@@ -678,6 +888,22 @@ impl Store {
         {
             self.conn
                 .execute("ALTER TABLE issues ADD COLUMN blocked_reason TEXT", [])?;
+        }
+        if !issue_columns
+            .iter()
+            .any(|column| column == "closeout_summary")
+        {
+            self.conn
+                .execute("ALTER TABLE issues ADD COLUMN closeout_summary TEXT", [])?;
+        }
+        if !issue_columns
+            .iter()
+            .any(|column| column == "follow_up_needed")
+        {
+            self.conn.execute(
+                "ALTER TABLE issues ADD COLUMN follow_up_needed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         let queued_columns = self.table_columns("queued_mutations")?;
         if !queued_columns
@@ -781,6 +1007,12 @@ impl Store {
              WHERE attention_reason IS NULL OR TRIM(attention_reason) = ''",
             [],
         )?;
+        self.conn.execute(
+            "UPDATE issues
+             SET follow_up_needed = 0
+             WHERE follow_up_needed IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -804,10 +1036,10 @@ impl Store {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, is_archived, sync_state, updated_at)
+            "INSERT INTO issues (remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at)
              VALUES
-             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'Core', '[\"offline\",\"ux\"]', 'needs_review', 'high', 'you', 'human', 'reviewer', 'review requested', NULL, 0, 'synced', ?1),
-             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'Personal', '[\"draft\"]', 'todo', 'medium', NULL, 'unassigned', NULL, 'needs triage', NULL, 0, 'pending_create', ?1)",
+             ('lin_1001', 'ENG-12', 'Make offline triage feel instant', 'Seed issue that demonstrates synced state and richer detail copy.', 'Core', '[\"offline\",\"ux\"]', 'needs_review', 'high', 'you', 'human', 'reviewer', 'review requested', NULL, NULL, 0, 0, 'synced', ?1),
+             (NULL, 'LOCAL-2', 'Draft local issue without network', 'This one starts as a queued local-only record to show the offline model.', 'Personal', '[\"draft\"]', 'todo', 'medium', NULL, 'unassigned', NULL, 'needs triage', NULL, NULL, 0, 0, 'pending_create', ?1)",
             [now.clone()],
         )?;
         self.enqueue(QueuedMutationKind::CreateIssue { issue_local_id: 2 })?;
@@ -831,6 +1063,21 @@ impl Store {
         self.conn.execute(
             "INSERT INTO artifacts (issue_local_id, run_id, kind, content_preview, location, created_at)
              VALUES (1, 1, 'note', 'Captured a short closeout note for the seed workflow.', NULL, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO handoffs (issue_local_id, from_actor, to_actor, note, created_at)
+             VALUES (1, 'human', 'reviewer', 'Initial review requested for the seed workflow.', ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO work_contexts (issue_local_id, repo_path, worktree_path, branch_name, is_active, created_at, updated_at)
+             VALUES (1, '/tmp/logit-demo', '/tmp/logit-demo', 'feature/offline-inbox', 1, ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO session_links (issue_local_id, session_ref, session_kind, label, last_heartbeat_at, is_active, created_at)
+             VALUES (1, 'session-1', 'agent_session', 'Codex worker', ?1, 1, ?1)",
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -1148,9 +1395,11 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         owner_name: row.get(11)?,
         attention_reason: row.get(12)?,
         blocked_reason: row.get(13)?,
-        is_archived: row.get::<_, i64>(14)? != 0,
-        sync_state: decode_sync_state(&row.get::<_, String>(15)?)?,
-        updated_at: parse_dt(row.get::<_, String>(16)?).map_err(to_sql_conversion_error)?,
+        closeout_summary: row.get(14)?,
+        follow_up_needed: row.get::<_, i64>(15)? != 0,
+        is_archived: row.get::<_, i64>(16)? != 0,
+        sync_state: decode_sync_state(&row.get::<_, String>(17)?)?,
+        updated_at: parse_dt(row.get::<_, String>(18)?).map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -1191,6 +1440,43 @@ fn map_artifact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord>
         content_preview: row.get(4)?,
         location: row.get(5)?,
         created_at: parse_dt(row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
+    })
+}
+
+fn map_handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRecord> {
+    Ok(HandoffRecord {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        from_actor: row.get(2)?,
+        to_actor: row.get(3)?,
+        note: row.get(4)?,
+        created_at: parse_dt(row.get::<_, String>(5)?).map_err(to_sql_conversion_error)?,
+    })
+}
+
+fn map_work_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkContext> {
+    Ok(WorkContext {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        repo_path: row.get(2)?,
+        worktree_path: row.get(3)?,
+        branch_name: row.get(4)?,
+        is_active: row.get::<_, i64>(5)? != 0,
+        created_at: parse_dt(row.get::<_, String>(6)?).map_err(to_sql_conversion_error)?,
+        updated_at: parse_dt(row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
+    })
+}
+
+fn map_session_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLink> {
+    Ok(SessionLink {
+        id: row.get(0)?,
+        issue_local_id: row.get(1)?,
+        session_ref: row.get(2)?,
+        session_kind: decode_session_kind(&row.get::<_, String>(3)?)?,
+        label: row.get(4)?,
+        last_heartbeat_at: parse_dt(row.get::<_, String>(5)?).map_err(to_sql_conversion_error)?,
+        is_active: row.get::<_, i64>(6)? != 0,
+        created_at: parse_dt(row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -1310,6 +1596,18 @@ fn decode_artifact_kind(value: &str) -> rusqlite::Result<ArtifactKind> {
         other => Err(to_sql_conversion_error(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown artifact kind {other}"),
+        ))),
+    }
+}
+
+fn decode_session_kind(value: &str) -> rusqlite::Result<SessionKind> {
+    match value {
+        "human_terminal" => Ok(SessionKind::HumanTerminal),
+        "agent_session" => Ok(SessionKind::AgentSession),
+        "background_job" => Ok(SessionKind::BackgroundJob),
+        other => Err(to_sql_conversion_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown session kind {other}"),
         ))),
     }
 }

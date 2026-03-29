@@ -1,15 +1,16 @@
 use crate::{
     config::WorkspaceConfig,
     domain::{
-        ArtifactKind, ArtifactRecord, Issue, IssueDraft, IssuePatch, IssueQuery, IssueStatus,
-        OwnerType, Priority, RunEventLevel, RunEventRecord, RunKind, RunRecord, RunStatus,
-        ScratchItem, ScratchSource, SyncState,
+        ArtifactKind, ArtifactRecord, HandoffRecord, Issue, IssueDraft, IssuePatch, IssueQuery,
+        IssueStatus, OwnerType, Priority, RunEventLevel, RunEventRecord, RunKind, RunRecord,
+        RunStatus, ScratchItem, ScratchSource, SessionKind, SessionLink, SyncState, WorkContext,
     },
     store::Store,
     sync::{LinearSyncService, SyncService},
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::{env, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Copy)]
 pub enum EditorFocus {
@@ -53,9 +54,18 @@ pub enum EditorMode {
     RunNote {
         run_id: i64,
     },
+    Closeout {
+        local_id: i64,
+    },
     ArtifactNote {
         issue_local_id: i64,
         run_id: Option<i64>,
+    },
+    WorkContext {
+        issue_local_id: i64,
+    },
+    SessionLink {
+        issue_local_id: i64,
     },
 }
 
@@ -72,6 +82,7 @@ pub struct EditorState {
     pub priority: Priority,
     pub search: String,
     pub scratch_source: ScratchSource,
+    pub follow_up_needed: bool,
 }
 
 pub struct App {
@@ -81,6 +92,9 @@ pub struct App {
     pub runs: Vec<RunRecord>,
     pub run_events: Vec<RunEventRecord>,
     pub artifacts: Vec<ArtifactRecord>,
+    pub handoffs: Vec<HandoffRecord>,
+    pub active_work_context: Option<WorkContext>,
+    pub active_session_link: Option<SessionLink>,
     pub selected: usize,
     pub query: IssueQuery,
     pub saved_view: SavedView,
@@ -90,6 +104,13 @@ pub struct App {
     pub show_help: bool,
     store: Store,
     sync_service: LinearSyncService,
+}
+
+#[derive(Debug, Clone)]
+struct GitContextPrefill {
+    repo_path: String,
+    worktree_path: Option<String>,
+    branch_name: Option<String>,
 }
 
 impl App {
@@ -104,6 +125,9 @@ impl App {
             runs: Vec::new(),
             run_events: Vec::new(),
             artifacts: Vec::new(),
+            handoffs: Vec::new(),
+            active_work_context: None,
+            active_session_link: None,
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -161,6 +185,12 @@ impl App {
             KeyCode::Char('z') => self.complete_latest_run_failure()?,
             KeyCode::Char('l') => self.begin_run_note_editor(),
             KeyCode::Char('o') => self.begin_artifact_editor(),
+            KeyCode::Char('c') => self.begin_closeout_editor(),
+            KeyCode::Char('O') => self.reopen_current_issue()?,
+            KeyCode::Char(']') => self.begin_work_context_editor(),
+            KeyCode::Char('[') => self.begin_session_link_editor(),
+            KeyCode::Char('}') => self.clear_work_context()?,
+            KeyCode::Char('{') => self.clear_session_link()?,
             KeyCode::Char('v') => self.toggle_archived_visibility(),
             KeyCode::Char('1') => self.set_saved_view(SavedView::Inbox),
             KeyCode::Char('2') => self.set_saved_view(SavedView::Running),
@@ -226,6 +256,7 @@ impl App {
             priority: Priority::Medium,
             search: String::new(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
         });
         self.status_message =
             "Creating a local issue. Tab moves fields, Ctrl+S/Ctrl+P cycle status and priority."
@@ -251,6 +282,7 @@ impl App {
             priority: issue.priority.clone(),
             search: self.query.search.clone().unwrap_or_default(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: issue.follow_up_needed,
         });
         self.status_message = format!("Editing {}", issue.identifier);
     }
@@ -268,6 +300,7 @@ impl App {
             priority: Priority::Medium,
             search: self.query.search.clone().unwrap_or_default(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
         });
         self.status_message =
             "Search issues by title, identifier, description, project, or labels".into();
@@ -286,6 +319,7 @@ impl App {
             priority: Priority::Medium,
             search: String::new(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
         });
         self.status_message =
             "Capturing scratch work. Use the title field for a quick note and Ctrl+O to cycle the source."
@@ -313,6 +347,7 @@ impl App {
             priority: Priority::Medium,
             search: String::new(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
         });
         self.status_message = "Write a run note, then press Enter to attach it.".into();
     }
@@ -343,8 +378,159 @@ impl App {
             priority: Priority::Medium,
             search: String::new(),
             scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
         });
         self.status_message = "Write an evidence note, then press Enter to attach it.".into();
+    }
+
+    pub fn begin_closeout_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected to close out".into();
+            return;
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::Closeout {
+                local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: issue.closeout_summary.unwrap_or_default(),
+            description: String::new(),
+            project: String::new(),
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Done,
+            priority: issue.priority,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+            follow_up_needed: issue.follow_up_needed,
+        });
+        self.status_message =
+            "Write a closeout summary. Ctrl+F toggles follow-up, Enter closes the issue.".into();
+    }
+
+    pub fn begin_work_context_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected for work context".into();
+            return;
+        };
+        let current = self.active_work_context.clone();
+        let detected = current
+            .as_ref()
+            .map(|ctx| GitContextPrefill {
+                repo_path: ctx.repo_path.clone(),
+                worktree_path: ctx.worktree_path.clone(),
+                branch_name: ctx.branch_name.clone(),
+            })
+            .or_else(detect_git_context_prefill);
+        self.editor = Some(EditorState {
+            mode: EditorMode::WorkContext {
+                issue_local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: detected
+                .as_ref()
+                .map(|ctx| ctx.repo_path.clone())
+                .unwrap_or_default(),
+            description: detected
+                .as_ref()
+                .and_then(|ctx| ctx.worktree_path.clone())
+                .unwrap_or_default(),
+            project: detected
+                .as_ref()
+                .and_then(|ctx| ctx.branch_name.clone())
+                .unwrap_or_default(),
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Todo,
+            priority: issue.priority,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
+        });
+        self.status_message =
+            "Attach repo/worktree/branch context. Git values are prefilled when available.".into();
+    }
+
+    pub fn begin_session_link_editor(&mut self) {
+        let Some(issue) = self.current_issue().cloned() else {
+            self.status_message = "No issue selected for session link".into();
+            return;
+        };
+        let current = self.active_session_link.clone();
+        let detected = current
+            .as_ref()
+            .map(|link| {
+                (
+                    link.label.clone(),
+                    link.session_kind.code().to_string(),
+                    link.session_ref.clone(),
+                )
+            })
+            .unwrap_or_else(default_session_prefill);
+        self.editor = Some(EditorState {
+            mode: EditorMode::SessionLink {
+                issue_local_id: issue.local_id,
+            },
+            focus: EditorFocus::Title,
+            title: detected.0,
+            description: detected.1,
+            project: detected.2,
+            labels: String::new(),
+            assignee: String::new(),
+            status: IssueStatus::Todo,
+            priority: issue.priority,
+            search: String::new(),
+            scratch_source: ScratchSource::Manual,
+            follow_up_needed: false,
+        });
+        self.status_message =
+            "Attach session context. Local terminal defaults are prefilled when available.".into();
+    }
+
+    pub fn reopen_current_issue(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        let mut patch = IssuePatch::empty();
+        patch.status = Some(IssueStatus::Todo);
+        patch.attention_reason = Some(Some("reopened for follow-up".into()));
+        let updated = self.store.update_issue(issue.local_id, &patch)?;
+        self.store.create_handoff(
+            issue.local_id,
+            issue
+                .owner_name
+                .as_deref()
+                .unwrap_or(issue.owner_type.label()),
+            "inbox",
+            "Issue reopened after closeout",
+        )?;
+        self.saved_view = SavedView::Inbox;
+        self.reload()?;
+        self.select_issue(updated.local_id);
+        self.status_message = format!("Reopened {}", updated.identifier);
+        Ok(())
+    }
+
+    pub fn clear_work_context(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        self.store.clear_active_work_context(issue.local_id)?;
+        self.reload()?;
+        self.select_issue(issue.local_id);
+        self.status_message = "Cleared active work context".into();
+        Ok(())
+    }
+
+    pub fn clear_session_link(&mut self) -> Result<()> {
+        let Some(issue) = self.current_issue().cloned() else {
+            return Ok(());
+        };
+        self.store.clear_active_session_link(issue.local_id)?;
+        self.reload()?;
+        self.select_issue(issue.local_id);
+        self.status_message = "Cleared active session link".into();
+        Ok(())
     }
 
     pub fn cycle_status(&mut self) -> Result<()> {
@@ -656,6 +842,13 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if matches!(editor.mode, EditorMode::Closeout { .. }) {
+                        editor.follow_up_needed = !editor.follow_up_needed;
+                    }
+                }
+            }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -768,6 +961,32 @@ impl App {
                 self.reload()?;
                 self.status_message = "Attached note to active run".into();
             }
+            EditorMode::Closeout { local_id } => {
+                let mut patch = IssuePatch::empty();
+                patch.status = Some(IssueStatus::Done);
+                patch.closeout_summary = Some(empty_to_none(&editor.title));
+                patch.follow_up_needed = Some(editor.follow_up_needed);
+                patch.attention_reason = Some(Some(if editor.follow_up_needed {
+                    "closed; follow-up still needed".into()
+                } else {
+                    "closed loop".into()
+                }));
+                let issue = self.store.update_issue(local_id, &patch)?;
+                self.store.create_handoff(
+                    local_id,
+                    "active work",
+                    "done",
+                    if editor.follow_up_needed {
+                        "Closed with follow-up still needed"
+                    } else {
+                        "Closed with summary"
+                    },
+                )?;
+                self.saved_view = SavedView::Done;
+                self.reload()?;
+                self.select_issue(issue.local_id);
+                self.status_message = format!("Closed {}", issue.identifier);
+            }
             EditorMode::ArtifactNote {
                 issue_local_id,
                 run_id,
@@ -787,6 +1006,40 @@ impl App {
                 self.reload()?;
                 self.select_issue(issue_local_id);
                 self.status_message = "Attached evidence note".into();
+            }
+            EditorMode::WorkContext { issue_local_id } => {
+                let repo_path = if editor.title.trim().is_empty() {
+                    ".".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                self.store.set_active_work_context(
+                    issue_local_id,
+                    &repo_path,
+                    empty_to_none(&editor.description).as_deref(),
+                    empty_to_none(&editor.project).as_deref(),
+                )?;
+                self.reload()?;
+                self.select_issue(issue_local_id);
+                self.status_message = "Attached work context".into();
+            }
+            EditorMode::SessionLink { issue_local_id } => {
+                let label = if editor.title.trim().is_empty() {
+                    "session".to_string()
+                } else {
+                    editor.title.trim().to_string()
+                };
+                let kind = parse_session_kind(&editor.description);
+                let session_ref = if editor.project.trim().is_empty() {
+                    "session-ref".to_string()
+                } else {
+                    editor.project.trim().to_string()
+                };
+                self.store
+                    .set_active_session_link(issue_local_id, &session_ref, kind, &label)?;
+                self.reload()?;
+                self.select_issue(issue_local_id);
+                self.status_message = "Attached session link".into();
             }
         }
 
@@ -933,6 +1186,10 @@ impl App {
         let Some(issue) = self.current_issue().cloned() else {
             return Ok(());
         };
+        let to_actor = owner_name
+            .as_deref()
+            .unwrap_or(owner_type.label())
+            .to_string();
         let mut patch = IssuePatch::empty();
         patch.status = Some(status);
         patch.owner_type = Some(owner_type);
@@ -940,6 +1197,15 @@ impl App {
         patch.attention_reason = Some(attention_reason);
         patch.blocked_reason = Some(blocked_reason);
         let updated = self.store.update_issue(issue.local_id, &patch)?;
+        self.store.create_handoff(
+            issue.local_id,
+            issue
+                .owner_name
+                .as_deref()
+                .unwrap_or(issue.owner_type.label()),
+            &to_actor,
+            message,
+        )?;
         self.reload()?;
         self.select_issue(updated.local_id);
         self.status_message = format!("{message}: {}", updated.identifier);
@@ -951,10 +1217,16 @@ impl App {
             self.runs = self.store.list_runs_for_issue(issue.local_id)?;
             self.run_events = self.store.list_run_events_for_issue(issue.local_id)?;
             self.artifacts = self.store.list_artifacts_for_issue(issue.local_id)?;
+            self.handoffs = self.store.list_handoffs_for_issue(issue.local_id)?;
+            self.active_work_context = self.store.get_active_work_context(issue.local_id)?;
+            self.active_session_link = self.store.get_active_session_link(issue.local_id)?;
         } else {
             self.runs.clear();
             self.run_events.clear();
             self.artifacts.clear();
+            self.handoffs.clear();
+            self.active_work_context = None;
+            self.active_session_link = None;
         }
         Ok(())
     }
@@ -986,6 +1258,16 @@ impl App {
             patch.blocked_reason = Some(None);
         }
         let _ = self.store.update_issue(issue.local_id, &patch)?;
+        self.store.create_handoff(
+            issue.local_id,
+            "run",
+            if status == RunStatus::Failed {
+                "human"
+            } else {
+                "review"
+            },
+            attention_reason,
+        )?;
         self.reload()?;
         self.status_message = format!(
             "Run #{} marked {}",
@@ -1037,6 +1319,63 @@ fn parse_labels(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_session_kind(value: &str) -> SessionKind {
+    match value.trim() {
+        "agent_session" | "agent" => SessionKind::AgentSession,
+        "background_job" | "job" => SessionKind::BackgroundJob,
+        _ => SessionKind::HumanTerminal,
+    }
+}
+
+fn detect_git_context_prefill() -> Option<GitContextPrefill> {
+    let cwd = env::current_dir().ok()?;
+    let cwd_display = cwd.display().to_string();
+    let repo_root = command_stdout(&cwd, "git", &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .unwrap_or(cwd.clone());
+    let branch_name = command_stdout(&cwd, "git", &["branch", "--show-current"]);
+    let worktree_path = if repo_root != cwd {
+        Some(cwd_display)
+    } else {
+        None
+    };
+
+    Some(GitContextPrefill {
+        repo_path: repo_root.display().to_string(),
+        worktree_path,
+        branch_name,
+    })
+}
+
+fn command_stdout(cwd: &std::path::Path, program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    normalize_command_output(String::from_utf8_lossy(&output.stdout).as_ref())
+}
+
+fn normalize_command_output(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn default_session_prefill() -> (String, String, String) {
+    (
+        "local terminal".into(),
+        "human_terminal".into(),
+        format!("pid:{}", std::process::id()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1399,9 @@ mod tests {
             runs: Vec::new(),
             run_events: Vec::new(),
             artifacts: Vec::new(),
+            handoffs: Vec::new(),
+            active_work_context: None,
+            active_session_link: None,
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -1200,5 +1542,229 @@ mod tests {
         assert_eq!(issue.status, IssueStatus::NeedsReview);
         assert_eq!(app.runs[0].status, RunStatus::Succeeded);
         Ok(())
+    }
+
+    #[test]
+    fn closeout_editor_persists_summary_and_follow_up() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Close me", "Need a wrap-up"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_closeout_editor();
+        for ch in "Wrapped with notes".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))?;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        let issue = app.store.get_issue(issue.local_id)?.expect("issue missing");
+        assert_eq!(issue.status, IssueStatus::Done);
+        assert_eq!(
+            issue.closeout_summary.as_deref(),
+            Some("Wrapped with notes")
+        );
+        assert!(issue.follow_up_needed);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_history_is_recorded_for_actor_transitions() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Handoff trail", "Need auditability"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.send_current_issue_to_agent()?;
+        assert_eq!(app.handoffs.len(), 1);
+        assert_eq!(app.handoffs[0].to_actor, "agent");
+
+        app.request_review()?;
+        assert!(!app.handoffs.is_empty());
+        assert!(
+            app.handoffs
+                .iter()
+                .any(|handoff| handoff.note.contains("review"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_creates_handoff_and_restores_inbox_status() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Reopen me", "Was closed too early"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_closeout_editor();
+        for ch in "closed for now".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+        app.reopen_current_issue()?;
+        let issue = app.store.get_issue(issue.local_id)?.expect("issue missing");
+        assert_eq!(issue.status, IssueStatus::Todo);
+        assert!(
+            app.handoffs
+                .iter()
+                .any(|handoff| handoff.note.contains("reopened"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn work_context_and_session_link_attach_and_clear() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app
+            .store
+            .create_issue(&IssueDraft::new("Context", "Need terminal context"))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_work_context_editor();
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.title.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "/repo".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.description.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "/repo-wt".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.project.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "feature/x".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        assert_eq!(
+            app.active_work_context
+                .as_ref()
+                .and_then(|ctx| ctx.branch_name.clone()),
+            Some("feature/x".into())
+        );
+
+        app.begin_session_link_editor();
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.title.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "Worker".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.description.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "agent_session".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        for _ in 0..app
+            .editor
+            .as_ref()
+            .map(|editor| editor.project.len())
+            .unwrap_or_default()
+        {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        for ch in "sess-1".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        assert_eq!(
+            app.active_session_link
+                .as_ref()
+                .map(|link| link.label.clone()),
+            Some("Worker".into())
+        );
+
+        app.clear_work_context()?;
+        app.clear_session_link()?;
+        assert!(app.active_work_context.is_none());
+        assert!(app.active_session_link.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn work_context_editor_prefills_from_current_environment() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app.store.create_issue(&IssueDraft::new(
+            "Context prefill",
+            "Should use cwd or git values",
+        ))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_work_context_editor();
+
+        let editor = app.editor.expect("editor should be open");
+        assert!(!editor.title.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn session_link_editor_prefills_local_terminal_defaults() -> Result<()> {
+        let mut app = test_app()?;
+        let issue = app.store.create_issue(&IssueDraft::new(
+            "Session prefill",
+            "Should use local terminal defaults",
+        ))?;
+        app.reload()?;
+        app.select_issue(issue.local_id);
+
+        app.begin_session_link_editor();
+
+        let editor = app.editor.expect("editor should be open");
+        assert_eq!(editor.title, "local terminal");
+        assert_eq!(editor.description, "human_terminal");
+        assert!(editor.project.starts_with("pid:"));
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_command_output_trims_and_drops_empty_values() {
+        assert_eq!(
+            normalize_command_output("  feature/test \n"),
+            Some("feature/test".into())
+        );
+        assert_eq!(normalize_command_output(" \n\t "), None);
     }
 }

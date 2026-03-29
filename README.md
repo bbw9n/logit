@@ -12,6 +12,9 @@ What works today:
 - Terminal-native issue states like `ready for agent`, `agent running`, `needs review`, and `blocked`
 - Scratch capture and promotion into full issues
 - Local run tracking with run notes and evidence snippets
+- Active worktree and session context per issue
+- Closeout summaries with follow-up tracking
+- Handoff history and reopen flow
 - SQLite-backed persistence
 - Search across identifier, title, description, project, and labels
 - Project and label organization
@@ -74,7 +77,13 @@ cargo test --locked
 - `z`: mark the latest active run as failed
 - `l`: attach a note to the latest active run
 - `o`: attach an evidence note to the selected issue
+- `c`: close the selected issue with a summary
+- `Shift+O`: reopen the selected done issue into the inbox
 - `a`: archive or restore the selected issue
+- `]`: attach repo/worktree/branch context to the selected issue
+- `[`: attach session context to the selected issue
+- `}`: clear the active work context
+- `{`: clear the active session link
 
 ### Views And Search
 
@@ -97,6 +106,35 @@ cargo test --locked
 Note:
 
 - Sync is still placeholder behavior right now. Without `LINEAR_API_KEY`, sync attempts mark queued items as failed. With a token set, the app exercises the sync path, but it does not yet perform real Linear API mutations.
+
+### Terminal-Native Context
+
+Each issue can carry the local execution context where work is happening:
+
+- Work context:
+  - repo path
+  - worktree path
+  - branch name
+- Session link:
+  - label
+  - kind: `human_terminal`, `agent_session`, or `background_job`
+  - session reference
+
+This is local-first metadata for terminal coordination. It is useful for coding workflows with multiple worktrees and for agent-driven tasks where the active worker lives in a shell session.
+
+When you open the work-context modal, `logit` now tries to prefill:
+
+- repo root from `git rev-parse --show-toplevel`
+- current branch from `git branch --show-current`
+- current working directory as the worktree path when it differs from the repo root
+
+Outside a git repo, it falls back gracefully to your current working directory.
+
+When you open the session-link modal without an existing session attached, it prefills a local terminal session with:
+
+- label: `local terminal`
+- kind: `human_terminal`
+- session ref: `pid:<current-process-id>`
 
 ## Data Storage
 
@@ -141,7 +179,7 @@ High-level structure:
 - [src/app.rs](src/app.rs): app state and keyboard workflows
 - [src/ui.rs](src/ui.rs): layout, panes, modals, help overlay
 - [src/store.rs](src/store.rs): SQLite CRUD, query, archive, queue logic
-- [src/domain.rs](src/domain.rs): issue, scratch, queue, and query types
+- [src/domain.rs](src/domain.rs): issue, scratch, run, handoff, work-context, and query types
 - [src/sync.rs](src/sync.rs): sync boundary and placeholder service
 
 ## Tests
@@ -155,6 +193,9 @@ The current test suite covers:
 - Scratch capture and promotion
 - Inbox view filtering by terminal-native issue state
 - Run lifecycle, run notes, and evidence capture
+- Work context and session-link persistence
+- Closeout summaries and follow-up flags
+- Handoff history and reopen transitions
 - Mutation queue cleanup
 - Sync-state transitions
 - Placeholder sync success and failure paths
@@ -171,4 +212,5 @@ Near-term directions:
 
 1. Add richer local workflows like handoffs, run history, and evidence-based closure.
 2. Improve local editor UX with richer text input and more obvious field affordances.
-3. Replace the placeholder sync layer with real Linear GraphQL integration.
+3. Add lightweight git/session autofill on top of the new work-context model.
+4. Replace the placeholder sync layer with real Linear GraphQL integration.
