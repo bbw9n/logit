@@ -218,6 +218,8 @@ pub struct App {
     pub handoffs: Vec<HandoffRecord>,
     pub active_work_context: Option<WorkContext>,
     pub active_session_link: Option<SessionLink>,
+    pub agent_roster: Vec<AgentRosterEntry>,
+    pub needs_human_count: usize,
     pub selected: usize,
     pub query: IssueQuery,
     pub saved_view: SavedView,
@@ -241,6 +243,14 @@ struct GitContextPrefill {
     behind_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentRosterEntry {
+    pub identifier: String,
+    pub session_label: String,
+    pub session_kind: SessionKind,
+    pub branch_name: Option<String>,
+}
+
 impl App {
     pub fn bootstrap() -> Result<Self> {
         let config = WorkspaceConfig::load()?;
@@ -256,6 +266,8 @@ impl App {
             handoffs: Vec::new(),
             active_work_context: None,
             active_session_link: None,
+            agent_roster: Vec::new(),
+            needs_human_count: 0,
             selected: 0,
             query: IssueQuery::default(),
             saved_view: SavedView::Inbox,
@@ -806,6 +818,7 @@ impl App {
         patch.status = Some(IssueStatus::AgentRunning);
         patch.attention_reason = Some(Some("execution in progress".into()));
         let _ = self.store.update_issue(issue.local_id, &patch)?;
+        self.saved_view = SavedView::Running;
         self.reload()?;
         self.status_message = format!("Started run #{} for {}", run.id, issue.identifier);
         Ok(())
@@ -974,6 +987,11 @@ impl App {
 
     fn reload(&mut self) -> Result<()> {
         let issues = self.store.list_issues(&self.query)?;
+        self.needs_human_count = issues
+            .iter()
+            .filter(|issue| issue_needs_human_attention(issue))
+            .count();
+        self.agent_roster = self.build_agent_roster(&issues)?;
         self.issues = self.filter_issues_for_view(issues);
         self.scratch_items = self.store.list_scratch_items()?;
         self.refresh_activity()?;
@@ -1306,6 +1324,8 @@ impl App {
             self.status_message = "Switched to scratch inbox".into();
         } else if matches!(view, SavedView::Done) {
             self.status_message = "Switched to done issues".into();
+        } else if matches!(view, SavedView::Inbox) {
+            self.status_message = "Switched to inbox".into();
         } else {
             self.status_message = format!("Switched to {}", view.label());
         }
@@ -1377,11 +1397,28 @@ impl App {
     }
 
     pub fn list_title(&self) -> &'static str {
-        if self.is_scratch_view() {
-            "Scratch"
-        } else {
-            "Inbox"
+        match self.saved_view {
+            SavedView::Inbox => "Inbox",
+            SavedView::Running => "Running",
+            SavedView::Review => "Review",
+            SavedView::Waiting => "Waiting",
+            SavedView::Done => "Done",
+            SavedView::Scratch => "Scratch",
         }
+    }
+
+    pub fn attention_summary(&self) -> String {
+        let agents_running = self
+            .agent_roster
+            .iter()
+            .filter(|entry| entry.session_kind == SessionKind::AgentSession)
+            .count();
+        format!(
+            "needs-human: {} | active-agents: {} | roster: {}",
+            self.needs_human_count,
+            agents_running,
+            self.agent_roster.len()
+        )
     }
 
     fn visible_len(&self) -> usize {
@@ -1396,8 +1433,13 @@ impl App {
         issues
             .into_iter()
             .filter(|issue| match self.saved_view {
-                SavedView::Inbox => issue.status.is_inbox_relevant(),
-                SavedView::Running => issue.status == IssueStatus::AgentRunning,
+                SavedView::Inbox => issue_needs_human_attention(issue),
+                SavedView::Running => {
+                    matches!(
+                        issue.status,
+                        IssueStatus::ReadyForAgent | IssueStatus::AgentRunning
+                    )
+                }
                 SavedView::Review => issue.status == IssueStatus::NeedsReview,
                 SavedView::Waiting => {
                     matches!(
@@ -1456,6 +1498,7 @@ impl App {
             &to_actor,
             message,
         )?;
+        self.saved_view = preferred_view_for_status(updated.status.clone());
         self.reload()?;
         self.select_issue(updated.local_id);
         self.status_message = format!("{message}: {}", updated.identifier);
@@ -1500,7 +1543,7 @@ impl App {
             .store
             .complete_run(run.id, status.clone(), summary, exit_code)?;
         let mut patch = IssuePatch::empty();
-        patch.status = Some(next_issue_status);
+        patch.status = Some(next_issue_status.clone());
         patch.attention_reason = Some(Some(attention_reason.into()));
         if status == RunStatus::Failed {
             patch.blocked_reason = Some(Some("latest run failed".into()));
@@ -1518,6 +1561,7 @@ impl App {
             },
             attention_reason,
         )?;
+        self.saved_view = preferred_view_for_status(next_issue_status);
         self.reload()?;
         self.status_message = format!(
             "Run #{} marked {}",
@@ -1558,6 +1602,31 @@ impl App {
 
         Ok(())
     }
+
+    fn build_agent_roster(&self, issues: &[Issue]) -> Result<Vec<AgentRosterEntry>> {
+        let mut roster = Vec::new();
+        for issue in issues.iter().filter(|issue| {
+            matches!(
+                issue.status,
+                IssueStatus::ReadyForAgent | IssueStatus::AgentRunning | IssueStatus::NeedsReview
+            ) || issue.owner_type == OwnerType::Agent
+        }) {
+            let active_session = self.store.get_active_session_link(issue.local_id)?;
+            let active_context = self.store.get_active_work_context(issue.local_id)?;
+            if let Some(session) = active_session {
+                roster.push(AgentRosterEntry {
+                    identifier: issue.identifier.clone(),
+                    session_label: session.label,
+                    session_kind: session.session_kind,
+                    branch_name: active_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.branch_name.clone()),
+                });
+            }
+        }
+        roster.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        Ok(roster)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1580,6 +1649,26 @@ impl SavedView {
             Self::Done => "done",
             Self::Scratch => "scratch",
         }
+    }
+}
+
+fn issue_needs_human_attention(issue: &Issue) -> bool {
+    matches!(
+        issue.status,
+        IssueStatus::Todo
+            | IssueStatus::NeedsHumanInput
+            | IssueStatus::NeedsReview
+            | IssueStatus::Blocked
+    )
+}
+
+fn preferred_view_for_status(status: IssueStatus) -> SavedView {
+    match status {
+        IssueStatus::ReadyForAgent | IssueStatus::AgentRunning => SavedView::Running,
+        IssueStatus::NeedsReview => SavedView::Review,
+        IssueStatus::Blocked => SavedView::Waiting,
+        IssueStatus::Done => SavedView::Done,
+        IssueStatus::Todo | IssueStatus::NeedsHumanInput => SavedView::Inbox,
     }
 }
 
@@ -1830,6 +1919,8 @@ mod tests {
             active_session_link: None,
             selected: 0,
             query: IssueQuery::default(),
+            agent_roster: Vec::new(),
+            needs_human_count: 0,
             saved_view: SavedView::Inbox,
             status_message: String::new(),
             queued_mutation_count: 0,
@@ -1883,6 +1974,7 @@ mod tests {
     #[test]
     fn inbox_views_filter_by_terminal_state() -> Result<()> {
         let mut app = test_app()?;
+        let todo = IssueDraft::new("Needs triage", "Human should see this");
         let mut running = IssueDraft::new("Agent run", "Agent is working");
         running.status = IssueStatus::AgentRunning;
         let mut review = IssueDraft::new("Needs review", "Waiting on approval");
@@ -1890,9 +1982,18 @@ mod tests {
         let mut done = IssueDraft::new("Closed loop", "Already finished");
         done.status = IssueStatus::Done;
 
+        app.store.create_issue(&todo)?;
         app.store.create_issue(&running)?;
         app.store.create_issue(&review)?;
         app.store.create_issue(&done)?;
+
+        app.set_saved_view(SavedView::Inbox);
+        assert_eq!(app.issues.len(), 2);
+        assert!(
+            app.issues
+                .iter()
+                .all(|issue| matches!(issue.status, IssueStatus::Todo | IssueStatus::NeedsReview))
+        );
 
         app.set_saved_view(SavedView::Running);
         assert_eq!(app.issues.len(), 1);
@@ -1905,6 +2006,43 @@ mod tests {
         app.set_saved_view(SavedView::Done);
         assert_eq!(app.issues.len(), 1);
         assert_eq!(app.issues[0].status, IssueStatus::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn roster_surfaces_active_agent_sessions() -> Result<()> {
+        let mut app = test_app()?;
+        let mut issue = IssueDraft::new("Parallel worker", "Should appear in roster");
+        issue.status = IssueStatus::AgentRunning;
+        issue.owner_type = OwnerType::Agent;
+        let issue = app.store.create_issue(&issue)?;
+        app.store.set_active_session_link(
+            issue.local_id,
+            "agent-1",
+            SessionKind::AgentSession,
+            "Worker A",
+        )?;
+        app.store.set_active_work_context(
+            issue.local_id,
+            "/repo",
+            Some("/repo/wt-a"),
+            Some("feature/a"),
+            Some("ahead 1"),
+            0,
+            0,
+            1,
+            0,
+        )?;
+
+        app.reload()?;
+
+        assert_eq!(app.agent_roster.len(), 1);
+        assert_eq!(app.agent_roster[0].identifier, issue.identifier);
+        assert_eq!(app.agent_roster[0].session_label, "Worker A");
+        assert_eq!(
+            app.agent_roster[0].branch_name.as_deref(),
+            Some("feature/a")
+        );
         Ok(())
     }
 

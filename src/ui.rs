@@ -261,6 +261,13 @@ fn issue_list_item(issue: &Issue, palette: Palette) -> ListItem<'_> {
                 Span::raw("")
             },
         ]),
+        Line::from(Span::styled(
+            issue
+                .attention_reason
+                .clone()
+                .unwrap_or_else(|| "no explicit attention reason".into()),
+            Style::default().fg(palette.muted),
+        )),
     ])
 }
 
@@ -553,10 +560,14 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("q", "quit", palette),
         Line::from(""),
         Line::from(Span::styled(
-            "Context",
+            "Attention",
             Style::default()
                 .fg(palette.title)
                 .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            app.attention_summary(),
+            Style::default().fg(palette.soft),
         )),
         Line::from(Span::styled(
             app.query_summary(),
@@ -565,6 +576,40 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         Line::from(Span::styled(
             app.pending_summary(),
             Style::default().fg(palette.soft),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Active Agents",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )),
+        if app.agent_roster.is_empty() {
+            Line::from(Span::styled(
+                "No active agent sessions",
+                Style::default().fg(palette.muted),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("{} active session(s)", app.agent_roster.len()),
+                Style::default().fg(palette.soft),
+            ))
+        },
+        Line::from(Span::styled(
+            app.agent_roster
+                .iter()
+                .take(4)
+                .map(|entry| {
+                    format!(
+                        "{} {} @ {}",
+                        entry.identifier,
+                        entry.session_label,
+                        entry.branch_name.as_deref().unwrap_or("no-branch")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Style::default().fg(palette.muted),
         )),
         Line::from(""),
         Line::from(Span::styled(

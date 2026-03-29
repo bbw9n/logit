@@ -21,6 +21,8 @@ What works today:
 - Project and label organization
 - Archive and restore flows
 - Saved views for inbox, running, review, waiting, done, and scratch work
+- Default home screen centered on the inbox
+- Lightweight active-agent roster derived from session/worktree/run state
 - Offline mutation queue and tested sync boundary behavior
 - GitHub Actions CI for format, check, and test
 
@@ -145,6 +147,8 @@ When you start a run with `t`, `logit` now also tries to:
 - ensure there is an active work context and session link
 - store the active session reference on the run record
 - append a run note summarizing the current repo/branch/git snapshot/session context
+
+The inbox is intentionally human-attention-first: it prioritizes items in `todo`, `needs human input`, `needs review`, and `blocked`, while the sidebar shows a compact roster of active agent sessions and their current branches.
 
 ## Data Storage
 

@@ -70,10 +70,6 @@ impl IssueStatus {
             Self::Done => "done",
         }
     }
-
-    pub fn is_inbox_relevant(&self) -> bool {
-        !matches!(self, Self::Done)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
