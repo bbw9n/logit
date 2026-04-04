@@ -25,6 +25,7 @@ What works today:
 - Archive and restore flows
 - Saved views for inbox, running, review, waiting, done, and scratch work
 - Structured interruption queue for open agent requests
+- Parent-only dispatch board for supervising active graphs
 - Default home screen centered on the inbox
 - Lightweight active-agent roster derived from session/worktree/run state
 - Offline mutation queue and tested sync boundary behavior
@@ -56,6 +57,14 @@ cargo check --locked
 cargo test --locked
 ```
 
+Hook-oriented execution updates:
+
+```bash
+cargo run -- hook start-run --issue LOCAL-1 --kind agent --summary "worker started" --session-ref worker-a --session-kind agent_session --session-label "Worker A"
+cargo run -- hook note --issue LOCAL-1 --message "checkpoint reached" --level info
+cargo run -- hook finish-run --issue LOCAL-1 --status succeeded --summary "worker finished cleanly"
+```
+
 ## Usage
 
 ### Navigation
@@ -76,6 +85,12 @@ cargo test --locked
 - `C`: move through the current dispatch graph
 - `V`: approve all review-ready child issues from a parent graph
 - `J`: requeue stalled child issues back to agents from a parent graph
+- `A`: acknowledge the selected interruption and requeue its issue to an agent
+- `E`: resolve all open interruptions across the selected dispatch graph
+- `S`: snooze the selected interruption for 30 minutes
+- `X`: escalate the selected interruption to the top of the queue
+- `H`: snooze all review interruptions in the selected graph
+- `B`: escalate all blocker interruptions in the selected graph
 - `x`: capture a scratch item
 - `i`: promote the selected scratch item into a full issue
 - `Enter`: save the current modal
@@ -110,6 +125,7 @@ cargo test --locked
 - `5`: done view
 - `6`: scratch view
 - `7`: interruption queue
+- `8`: dispatch board
 - `v`: toggle archived visibility in the current view
 - `/`: open search
 - `u`: clear search
@@ -119,6 +135,17 @@ cargo test --locked
 
 - `y`: attempt sync
 - `r`: retry failed sync states
+
+### Hook Commands
+
+`logit` also exposes a small non-TUI execution hook surface for shells, wrappers, and agent runtimes:
+
+- `logit hook start-run --issue LOCAL-1 [--kind agent|manual|shell|script] [--summary ...] [--session-ref ...] [--session-kind ...] [--session-label ...] [--repo-path ...] [--worktree-path ...] [--branch ...] [--git-status ...]`
+- `logit hook finish-run --issue LOCAL-1 [--status succeeded|failed|cancelled] [--summary ...] [--exit-code ...]`
+- `logit hook note --issue LOCAL-1 --message ... [--level info|warn|error]`
+- `logit hook heartbeat --issue LOCAL-1 --session-ref ... [--session-kind ...] [--session-label ...]`
+
+These commands write directly into the same SQLite store as the TUI, so hook-driven execution shows up in runs, session state, and the supervision surfaces automatically.
 
 Note:
 
@@ -182,6 +209,10 @@ The detail pane shows parent/root status, dispatched sub-issues, and structured 
 The inbox and sidebar also surface a compact parallel-work summary, so parent issues are easier to scan as coordination nodes rather than plain tasks.
 
 The interruption queue gives humans a dedicated place to process open agent questions, blockers, and review requests without relying on the currently selected issue.
+It now supports lightweight triage too: snoozed interruptions drop out of the queue until they are due again, and escalated interruptions bubble to the top.
+The sidebar now mirrors that urgency with interruption summary lines for open, escalated, snoozed, due-soon, and next-due state.
+
+The dispatch board is the graph-first counterpart: it shows parent issues with active child graphs so a human can supervise and rebalance parallel work from one place.
 
 You can now move through a dispatch graph directly from the terminal:
 
@@ -189,6 +220,12 @@ You can now move through a dispatch graph directly from the terminal:
 - `C` jumps from a parent to the most actionable child, or from a child to the next sibling in the graph
 - `V` approves all review-ready children from the selected parent issue
 - `J` requeues stalled children (`todo`, `needs human input`, `blocked`) back to `ready for agent`
+- `A` acknowledges the selected interruption and sends that issue back to an agent
+- `E` resolves all open interruptions across the selected graph
+- `S` snoozes the selected interruption for 30 minutes
+- `X` escalates the selected interruption to the top of the queue
+- `H` snoozes all review interruptions in the selected graph
+- `B` escalates all blocker interruptions in the selected graph
 
 ## Data Storage
 

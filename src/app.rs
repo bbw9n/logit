@@ -234,6 +234,10 @@ pub struct App {
     pub needs_human_count: usize,
     pub stale_agent_count: usize,
     pub open_agent_request_count: usize,
+    pub escalated_interruptions_count: usize,
+    pub snoozed_interruptions_count: usize,
+    pub due_soon_interruptions_count: usize,
+    pub next_interruption_due_label: Option<String>,
     pub parallel_parent_count: usize,
     pub parallel_subissue_count: usize,
     pub selected: usize,
@@ -274,6 +278,14 @@ pub struct AgentRosterEntry {
 pub struct InterruptionItem {
     pub request: AgentRequest,
     pub issue: Issue,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InterruptionOverview {
+    escalated_count: usize,
+    snoozed_count: usize,
+    due_soon_count: usize,
+    next_due_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -352,6 +364,10 @@ impl App {
             needs_human_count: 0,
             stale_agent_count: 0,
             open_agent_request_count: 0,
+            escalated_interruptions_count: 0,
+            snoozed_interruptions_count: 0,
+            due_soon_interruptions_count: 0,
+            next_interruption_due_label: None,
             parallel_parent_count: 0,
             parallel_subissue_count: 0,
             selected: 0,
@@ -414,6 +430,12 @@ impl App {
             KeyCode::Char('C') => self.jump_to_next_graph_issue()?,
             KeyCode::Char('V') => self.approve_review_children()?,
             KeyCode::Char('J') => self.requeue_stalled_children()?,
+            KeyCode::Char('A') => self.acknowledge_interruption_and_requeue()?,
+            KeyCode::Char('E') => self.resolve_graph_interruptions()?,
+            KeyCode::Char('S') => self.snooze_selected_interruption()?,
+            KeyCode::Char('X') => self.escalate_selected_interruption()?,
+            KeyCode::Char('H') => self.snooze_graph_review_interruptions()?,
+            KeyCode::Char('B') => self.escalate_graph_blockers()?,
             KeyCode::Char('x') => self.begin_scratch_editor(),
             KeyCode::Char('i') => self.promote_selected_scratch()?,
             KeyCode::Char('s') => self.cycle_status()?,
@@ -442,6 +464,7 @@ impl App {
             KeyCode::Char('5') => self.set_saved_view(SavedView::Done),
             KeyCode::Char('6') => self.set_saved_view(SavedView::Scratch),
             KeyCode::Char('7') => self.set_saved_view(SavedView::Interruptions),
+            KeyCode::Char('8') => self.set_saved_view(SavedView::DispatchBoard),
             KeyCode::Char('?') => self.toggle_help(),
             KeyCode::Char('y') => self.sync_now()?,
             KeyCode::Char('r') => self.retry_failed_sync()?,
@@ -1171,6 +1194,11 @@ impl App {
                     .count(),
             )
         })?;
+        let interruption_overview = self.build_interruption_overview(&issues)?;
+        self.escalated_interruptions_count = interruption_overview.escalated_count;
+        self.snoozed_interruptions_count = interruption_overview.snoozed_count;
+        self.due_soon_interruptions_count = interruption_overview.due_soon_count;
+        self.next_interruption_due_label = interruption_overview.next_due_label;
         self.agent_roster = self.build_agent_roster(&issues)?;
         self.stale_agent_count = self
             .agent_roster
@@ -1708,6 +1736,7 @@ impl App {
             SavedView::Done => "Done",
             SavedView::Scratch => "Scratch",
             SavedView::Interruptions => "Interruptions",
+            SavedView::DispatchBoard => "Dispatch Board",
         }
     }
 
@@ -1726,6 +1755,22 @@ impl App {
             self.parallel_subissue_count,
             self.agent_roster.len()
         )
+    }
+
+    pub fn interruption_glance_summary(&self) -> String {
+        format!(
+            "open: {} | escalated: {} | snoozed: {} | due-soon: {}",
+            self.open_agent_request_count,
+            self.escalated_interruptions_count,
+            self.snoozed_interruptions_count,
+            self.due_soon_interruptions_count
+        )
+    }
+
+    pub fn interruption_due_summary(&self) -> String {
+        self.next_interruption_due_label
+            .clone()
+            .unwrap_or_else(|| "next due: none".into())
     }
 
     pub fn dispatch_summary_for_issue(&self, local_id: i64) -> Option<&DispatchSummary> {
@@ -1796,6 +1841,9 @@ impl App {
                 SavedView::Done => issue.status == IssueStatus::Done,
                 SavedView::Scratch => false,
                 SavedView::Interruptions => false,
+                SavedView::DispatchBoard => {
+                    self.dispatch_summary_for_issue(issue.local_id).is_some()
+                }
             })
             .collect()
     }
@@ -1934,6 +1982,236 @@ impl App {
         self.reload()?;
         self.select_issue(issue.local_id);
         self.status_message = format!("Resolved request on {}", issue.identifier);
+        Ok(())
+    }
+
+    fn acknowledge_interruption_and_requeue(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let _ = self.store.resolve_agent_request(interruption.request.id)?;
+        let mut patch = IssuePatch::empty();
+        patch.status = Some(IssueStatus::ReadyForAgent);
+        patch.owner_type = Some(OwnerType::Agent);
+        patch.owner_name = Some(Some("agent".into()));
+        patch.attention_reason = Some(Some("requeued after interruption acknowledgement".into()));
+        patch.blocked_reason = Some(None);
+        self.store
+            .update_issue(interruption.issue.local_id, &patch)?;
+        self.store.create_handoff(
+            interruption.issue.local_id,
+            "human",
+            "agent",
+            "Acknowledged interruption and requeued to agent",
+        )?;
+        self.reload()?;
+        self.status_message = format!(
+            "Acknowledged interruption and requeued {}",
+            interruption.issue.identifier
+        );
+        Ok(())
+    }
+
+    fn resolve_graph_interruptions(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let graph_root_id = interruption
+            .issue
+            .parent_id
+            .unwrap_or(interruption.issue.local_id);
+        let mut affected_issue_ids = vec![graph_root_id];
+        affected_issue_ids.extend(
+            self.store
+                .list_subissues(graph_root_id)?
+                .into_iter()
+                .map(|issue| issue.local_id),
+        );
+
+        let mut resolved = 0usize;
+        for issue_id in affected_issue_ids {
+            for request in self
+                .store
+                .list_agent_requests_for_issue(issue_id)?
+                .into_iter()
+                .filter(|request| request.status == AgentRequestStatus::Open)
+            {
+                let _ = self.store.resolve_agent_request(request.id)?;
+                resolved += 1;
+            }
+        }
+
+        if resolved == 0 {
+            self.status_message = "No open interruptions in this graph".into();
+            return Ok(());
+        }
+
+        self.store.create_handoff(
+            graph_root_id,
+            "human",
+            "graph",
+            "Resolved open interruptions across dispatch graph",
+        )?;
+        self.reload()?;
+        self.status_message = format!("Resolved {resolved} interruption(s) across the graph");
+        Ok(())
+    }
+
+    fn snooze_selected_interruption(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let until = Utc::now() + Duration::minutes(30);
+        let _ = self
+            .store
+            .snooze_agent_request(interruption.request.id, until)?;
+        self.store.create_handoff(
+            interruption.issue.local_id,
+            "human",
+            "later",
+            "Snoozed interruption for 30 minutes",
+        )?;
+        self.reload()?;
+        self.status_message = format!(
+            "Snoozed interruption on {} until {}",
+            interruption.issue.identifier,
+            until.format("%H:%M UTC")
+        );
+        Ok(())
+    }
+
+    fn escalate_selected_interruption(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let Some(updated_request) = self.store.escalate_agent_request(interruption.request.id)?
+        else {
+            self.status_message = "Selected interruption no longer exists".into();
+            return Ok(());
+        };
+        let mut patch = IssuePatch::empty();
+        patch.attention_reason = Some(Some(format!(
+            "escalated interruption: {} (level {})",
+            updated_request.title.to_lowercase(),
+            updated_request.escalation_level
+        )));
+        self.store
+            .update_issue(interruption.issue.local_id, &patch)?;
+        self.store.create_handoff(
+            interruption.issue.local_id,
+            "human",
+            "escalated",
+            &format!(
+                "Escalated interruption to level {}",
+                updated_request.escalation_level
+            ),
+        )?;
+        self.reload()?;
+        self.status_message = format!(
+            "Escalated interruption on {} to level {}",
+            interruption.issue.identifier, updated_request.escalation_level
+        );
+        Ok(())
+    }
+
+    fn snooze_graph_review_interruptions(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let graph_root_id = interruption
+            .issue
+            .parent_id
+            .unwrap_or(interruption.issue.local_id);
+        let until = Utc::now() + Duration::hours(1);
+        let mut affected_issue_ids = vec![graph_root_id];
+        affected_issue_ids.extend(
+            self.store
+                .list_subissues(graph_root_id)?
+                .into_iter()
+                .map(|issue| issue.local_id),
+        );
+
+        let mut snoozed = 0usize;
+        for issue_id in affected_issue_ids {
+            for request in self
+                .store
+                .list_agent_requests_for_issue(issue_id)?
+                .into_iter()
+                .filter(|request| {
+                    request.status == AgentRequestStatus::Open
+                        && request.kind == AgentRequestKind::Review
+                })
+            {
+                let _ = self.store.snooze_agent_request(request.id, until)?;
+                snoozed += 1;
+            }
+        }
+
+        if snoozed == 0 {
+            self.status_message = "No open review interruptions in this graph".into();
+            return Ok(());
+        }
+
+        self.store.create_handoff(
+            graph_root_id,
+            "human",
+            "later",
+            "Snoozed review interruptions across dispatch graph",
+        )?;
+        self.reload()?;
+        self.status_message = format!(
+            "Snoozed {snoozed} review interruption(s) until {}",
+            until.format("%H:%M UTC")
+        );
+        Ok(())
+    }
+
+    fn escalate_graph_blockers(&mut self) -> Result<()> {
+        let Some(interruption) = self.current_interruption().cloned() else {
+            return Ok(());
+        };
+        let graph_root_id = interruption
+            .issue
+            .parent_id
+            .unwrap_or(interruption.issue.local_id);
+        let mut affected_issue_ids = vec![graph_root_id];
+        affected_issue_ids.extend(
+            self.store
+                .list_subissues(graph_root_id)?
+                .into_iter()
+                .map(|issue| issue.local_id),
+        );
+
+        let mut escalated = 0usize;
+        for issue_id in affected_issue_ids {
+            for request in self
+                .store
+                .list_agent_requests_for_issue(issue_id)?
+                .into_iter()
+                .filter(|request| {
+                    request.status == AgentRequestStatus::Open
+                        && request.kind == AgentRequestKind::Blocker
+                })
+            {
+                let _ = self.store.escalate_agent_request(request.id)?;
+                escalated += 1;
+            }
+        }
+
+        if escalated == 0 {
+            self.status_message = "No open blocker interruptions in this graph".into();
+            return Ok(());
+        }
+
+        self.store.create_handoff(
+            graph_root_id,
+            "human",
+            "escalated",
+            "Escalated blocker interruptions across dispatch graph",
+        )?;
+        self.reload()?;
+        self.status_message =
+            format!("Escalated {escalated} blocker interruption(s) across the graph");
         Ok(())
     }
 
@@ -2234,12 +2512,19 @@ impl App {
 
     fn build_interruption_queue(&self, issues: &[Issue]) -> Result<Vec<InterruptionItem>> {
         let mut queue = Vec::new();
+        let now = Utc::now();
         for issue in issues {
             for request in self
                 .store
                 .list_agent_requests_for_issue(issue.local_id)?
                 .into_iter()
-                .filter(|request| request.status == AgentRequestStatus::Open)
+                .filter(|request| {
+                    request.status == AgentRequestStatus::Open
+                        && request
+                            .snoozed_until
+                            .map(|until| until <= now)
+                            .unwrap_or(true)
+                })
             {
                 queue.push(InterruptionItem {
                     request,
@@ -2247,8 +2532,49 @@ impl App {
                 });
             }
         }
-        queue.sort_by(|left, right| right.request.created_at.cmp(&left.request.created_at));
+        queue.sort_by(|left, right| {
+            right
+                .request
+                .escalation_level
+                .cmp(&left.request.escalation_level)
+                .then_with(|| right.request.created_at.cmp(&left.request.created_at))
+        });
         Ok(queue)
+    }
+
+    fn build_interruption_overview(&self, issues: &[Issue]) -> Result<InterruptionOverview> {
+        let now = Utc::now();
+        let mut overview = InterruptionOverview::default();
+        let mut next_due: Option<DateTime<Utc>> = None;
+
+        for issue in issues {
+            for request in self
+                .store
+                .list_agent_requests_for_issue(issue.local_id)?
+                .into_iter()
+                .filter(|request| request.status == AgentRequestStatus::Open)
+            {
+                if request.escalation_level > 0 {
+                    overview.escalated_count += 1;
+                }
+                if let Some(until) = request.snoozed_until {
+                    if until > now {
+                        overview.snoozed_count += 1;
+                        if until <= now + Duration::hours(1) {
+                            overview.due_soon_count += 1;
+                        }
+                        next_due = Some(match next_due {
+                            Some(current) => current.min(until),
+                            None => until,
+                        });
+                    }
+                }
+            }
+        }
+
+        overview.next_due_label =
+            next_due.map(|due| format!("next due: {}", relative_future_label(now, due)));
+        Ok(overview)
     }
 }
 
@@ -2261,6 +2587,7 @@ pub enum SavedView {
     Done,
     Scratch,
     Interruptions,
+    DispatchBoard,
 }
 
 impl SavedView {
@@ -2273,6 +2600,7 @@ impl SavedView {
             Self::Done => "done",
             Self::Scratch => "scratch",
             Self::Interruptions => "interruptions",
+            Self::DispatchBoard => "dispatch-board",
         }
     }
 }
@@ -2310,6 +2638,19 @@ fn graph_issue_rank(status: &IssueStatus) -> u8 {
         IssueStatus::ReadyForAgent => 4,
         IssueStatus::AgentRunning => 5,
         IssueStatus::Done => 6,
+    }
+}
+
+fn relative_future_label(now: DateTime<Utc>, due: DateTime<Utc>) -> String {
+    let delta = due - now;
+    if delta <= Duration::zero() {
+        "now".into()
+    } else if delta < Duration::hours(1) {
+        format!("in {}m", delta.num_minutes().max(1))
+    } else if delta < Duration::days(1) {
+        format!("in {}h", delta.num_hours().max(1))
+    } else {
+        format!("in {}d", delta.num_days().max(1))
     }
 }
 
@@ -2612,6 +2953,10 @@ mod tests {
             needs_human_count: 0,
             stale_agent_count: 0,
             open_agent_request_count: 0,
+            escalated_interruptions_count: 0,
+            snoozed_interruptions_count: 0,
+            due_soon_interruptions_count: 0,
+            next_interruption_due_label: None,
             parallel_parent_count: 0,
             parallel_subissue_count: 0,
             saved_view: SavedView::Inbox,
@@ -3373,6 +3718,257 @@ mod tests {
                 .into_iter()
                 .all(|request| request.status == AgentRequestStatus::Resolved)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_board_lists_parent_graphs_only() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Board parent", "Should appear on board"))?;
+        let standalone = app
+            .store
+            .create_issue(&IssueDraft::new("Standalone", "Should not appear on board"))?;
+
+        let mut child = IssueDraft::new("Board child", "Attach to parent");
+        child.parent_id = Some(parent.local_id);
+        child.status = IssueStatus::ReadyForAgent;
+        app.store.create_issue(&child)?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::DispatchBoard);
+
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].local_id, parent.local_id);
+        assert_ne!(app.issues[0].local_id, standalone.local_id);
+        Ok(())
+    }
+
+    #[test]
+    fn interruption_queue_bulk_actions_ack_and_resolve_graph() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app.store.create_issue(&IssueDraft::new(
+            "Graph root",
+            "Supervise interruption graph",
+        ))?;
+
+        let mut child = IssueDraft::new("Interrupted child", "Needs follow-up");
+        child.parent_id = Some(parent.local_id);
+        child.status = IssueStatus::NeedsHumanInput;
+        child.owner_type = OwnerType::Agent;
+        let child = app.store.create_issue(&child)?;
+        app.store.create_agent_request(
+            parent.local_id,
+            AgentRequestKind::Blocker,
+            "Root blocker",
+            "Need parent-level decision",
+            "worker-b",
+        )?;
+        app.store.create_agent_request(
+            child.local_id,
+            AgentRequestKind::Question,
+            "Need answer",
+            "Should I continue?",
+            "worker-a",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+
+        app.acknowledge_interruption_and_requeue()?;
+        let child = app.store.get_issue(child.local_id)?.expect("child missing");
+        assert_eq!(child.status, IssueStatus::ReadyForAgent);
+
+        app.resolve_graph_interruptions()?;
+        assert!(
+            app.store
+                .list_agent_requests_for_issue(parent.local_id)?
+                .into_iter()
+                .all(|request| request.status == AgentRequestStatus::Resolved)
+        );
+        assert!(
+            app.store
+                .list_agent_requests_for_issue(child.local_id)?
+                .into_iter()
+                .all(|request| request.status == AgentRequestStatus::Resolved)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snoozed_interruptions_leave_queue_until_due() -> Result<()> {
+        let mut app = test_app()?;
+        let mut issue = IssueDraft::new("Snooze me", "Should disappear from queue");
+        issue.status = IssueStatus::AgentRunning;
+        issue.owner_type = OwnerType::Agent;
+        let issue = app.store.create_issue(&issue)?;
+        app.store.create_agent_request(
+            issue.local_id,
+            AgentRequestKind::Question,
+            "Later please",
+            "This can wait",
+            "worker-a",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+        app.snooze_selected_interruption()?;
+
+        assert!(app.interruptions.is_empty());
+        let request = app
+            .store
+            .list_agent_requests_for_issue(issue.local_id)?
+            .into_iter()
+            .next()
+            .expect("request missing");
+        assert!(request.snoozed_until.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn escalated_interruptions_sort_to_top() -> Result<()> {
+        let mut app = test_app()?;
+        let mut older = IssueDraft::new("Older request", "Should bubble after escalation");
+        older.status = IssueStatus::AgentRunning;
+        older.owner_type = OwnerType::Agent;
+        let older = app.store.create_issue(&older)?;
+        app.store.create_agent_request(
+            older.local_id,
+            AgentRequestKind::Question,
+            "Older",
+            "First request",
+            "worker-a",
+        )?;
+
+        let mut newer = IssueDraft::new("Newer request", "Starts ahead by recency");
+        newer.status = IssueStatus::AgentRunning;
+        newer.owner_type = OwnerType::Agent;
+        let newer = app.store.create_issue(&newer)?;
+        app.store.create_agent_request(
+            newer.local_id,
+            AgentRequestKind::Question,
+            "Newer",
+            "Second request",
+            "worker-b",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+        assert_eq!(
+            app.current_interruption().map(|item| item.issue.local_id),
+            Some(newer.local_id)
+        );
+
+        app.selected = 1;
+        app.escalate_selected_interruption()?;
+
+        assert_eq!(
+            app.interruptions.first().map(|item| item.issue.local_id),
+            Some(older.local_id)
+        );
+        assert_eq!(app.interruptions[0].request.escalation_level, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn interruption_overview_tracks_escalation_and_due_soon() -> Result<()> {
+        let mut app = test_app()?;
+        let mut issue = IssueDraft::new("Overview", "Sidebar interruption summary");
+        issue.status = IssueStatus::AgentRunning;
+        issue.owner_type = OwnerType::Agent;
+        let issue = app.store.create_issue(&issue)?;
+        let snoozed_request = app.store.create_agent_request(
+            issue.local_id,
+            AgentRequestKind::Question,
+            "Soon due",
+            "This will be snoozed briefly",
+            "worker-a",
+        )?;
+        app.store
+            .snooze_agent_request(snoozed_request.id, Utc::now() + Duration::minutes(20))?;
+        let escalated_request = app.store.create_agent_request(
+            issue.local_id,
+            AgentRequestKind::Blocker,
+            "Escalated",
+            "This should count as escalated",
+            "worker-b",
+        )?;
+        app.store.escalate_agent_request(escalated_request.id)?;
+
+        app.reload()?;
+
+        assert_eq!(app.escalated_interruptions_count, 1);
+        assert_eq!(app.snoozed_interruptions_count, 1);
+        assert_eq!(app.due_soon_interruptions_count, 1);
+        assert!(
+            app.interruption_due_summary().contains("next due: in")
+                || app.interruption_due_summary().contains("next due: now")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_review_interruptions_can_be_snoozed_in_bulk() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Root", "Graph review queue"))?;
+        let mut child = IssueDraft::new("Review child", "Needs review interruption");
+        child.parent_id = Some(parent.local_id);
+        child.status = IssueStatus::NeedsReview;
+        let child = app.store.create_issue(&child)?;
+        app.store.create_agent_request(
+            child.local_id,
+            AgentRequestKind::Review,
+            "Review me",
+            "Please check this",
+            "worker-a",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+        app.snooze_graph_review_interruptions()?;
+
+        let request = app
+            .store
+            .list_agent_requests_for_issue(child.local_id)?
+            .into_iter()
+            .next()
+            .expect("request missing");
+        assert!(request.snoozed_until.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn graph_blocker_interruptions_can_be_escalated_in_bulk() -> Result<()> {
+        let mut app = test_app()?;
+        let parent = app
+            .store
+            .create_issue(&IssueDraft::new("Root", "Graph blocker queue"))?;
+        let mut child = IssueDraft::new("Blocked child", "Needs blocker escalation");
+        child.parent_id = Some(parent.local_id);
+        child.status = IssueStatus::Blocked;
+        let child = app.store.create_issue(&child)?;
+        app.store.create_agent_request(
+            child.local_id,
+            AgentRequestKind::Blocker,
+            "Blocker",
+            "This is blocked",
+            "worker-a",
+        )?;
+
+        app.reload()?;
+        app.set_saved_view(SavedView::Interruptions);
+        app.escalate_graph_blockers()?;
+
+        let request = app
+            .store
+            .list_agent_requests_for_issue(child.local_id)?
+            .into_iter()
+            .next()
+            .expect("request missing");
+        assert_eq!(request.escalation_level, 1);
         Ok(())
     }
 }

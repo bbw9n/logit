@@ -330,6 +330,8 @@ pub struct AgentRequest {
     pub body: String,
     pub requested_by: String,
     pub status: AgentRequestStatus,
+    pub snoozed_until: Option<DateTime<Utc>>,
+    pub escalation_level: i64,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
 }

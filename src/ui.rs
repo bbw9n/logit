@@ -358,6 +358,17 @@ fn interruption_list_item(item: &InterruptionItem, palette: Palette) -> ListItem
                 badge_bg(kind_color, palette),
             ),
             Span::raw(" "),
+            if item.request.escalation_level > 0 {
+                Span::styled(
+                    format!(" escalation {} ", item.request.escalation_level),
+                    Style::default()
+                        .fg(palette.white)
+                        .bg(palette.error_bg)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             Span::styled(
                 format!("requested by {}", item.request.requested_by),
                 Style::default().fg(palette.soft),
@@ -441,6 +452,20 @@ fn render_primary_detail(
             Line::from(""),
             meta_line("Kind", interruption.request.kind.label(), palette),
             meta_line("Status", interruption.request.status.label(), palette),
+            meta_line(
+                "Escalation",
+                interruption.request.escalation_level.to_string(),
+                palette,
+            ),
+            meta_line(
+                "Snoozed Until",
+                interruption
+                    .request
+                    .snoozed_until
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| "not snoozed".to_string()),
+                palette,
+            ),
             meta_line("Issue", interruption.issue.title.as_str(), palette),
             meta_line("Issue State", interruption.issue.status.label(), palette),
             meta_line(
@@ -467,7 +492,7 @@ fn render_primary_detail(
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "Interruptions are the supervision queue. Press Q to resolve this request.",
+                "Interruptions are the supervision queue. Q resolves one, A requeues this issue, E resolves the whole graph, S snoozes 30m, X escalates, H snoozes graph reviews, B escalates graph blockers.",
                 Style::default().fg(palette.muted),
             )),
         ])
@@ -693,6 +718,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("R / Q", "open / resolve request", palette),
         key_line("P / C", "parent / next graph item", palette),
         key_line("V / J", "approve review / requeue stalled graph", palette),
+        key_line("A / E", "ack / resolve graph interruptions", palette),
+        key_line("S / X", "snooze / escalate interruption", palette),
+        key_line("H / B", "snooze reviews / escalate blockers", palette),
         key_line("x", "capture scratch item", palette),
         key_line("i", "promote scratch into issue", palette),
         key_line("s / p", "cycle status / priority", palette),
@@ -708,6 +736,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         key_line("1 / 2 / 3", "inbox / running / review", palette),
         key_line("4 / 5 / 6", "waiting / done / scratch", palette),
         key_line("7", "interruption queue", palette),
+        key_line("8", "dispatch board", palette),
         key_line("/", "search", palette),
         key_line("u", "clear search", palette),
         key_line("?", "help overlay", palette),
@@ -739,6 +768,21 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect, pal
         Line::from(Span::styled(
             app.pending_summary(),
             Style::default().fg(palette.soft),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Interruptions",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            app.interruption_glance_summary(),
+            Style::default().fg(palette.soft),
+        )),
+        Line::from(Span::styled(
+            app.interruption_due_summary(),
+            Style::default().fg(palette.muted),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -942,7 +986,7 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("3. Press x to capture rough notes before they become full issues."),
         Line::from("4. Use Tab to move fields, arrows/Home/End to move cursor, Enter to save."),
         Line::from("5. Use Ctrl+J or Shift+Enter inside a modal to insert a newline."),
-        Line::from("6. Search with / and switch saved views with 1 through 6."),
+        Line::from("6. Search with / and switch saved views with 1 through 8."),
         Line::from(""),
         Line::from("Views"),
         Line::from("1 inbox"),
@@ -952,6 +996,7 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("5 done"),
         Line::from("6 scratch"),
         Line::from("7 interruptions"),
+        Line::from("8 dispatch board"),
         Line::from(""),
         Line::from("Issue actions"),
         Line::from("D dispatch a sub-issue from the selected issue"),
@@ -961,6 +1006,12 @@ fn render_help(frame: &mut Frame, app: &App, palette: Palette) {
         Line::from("C move through the dispatch graph"),
         Line::from("V approve review-ready child issues from the parent graph"),
         Line::from("J requeue stalled child issues back to agents"),
+        Line::from("A acknowledge selected interruption and requeue its issue"),
+        Line::from("E resolve all open interruptions in the selected graph"),
+        Line::from("S snooze the selected interruption for 30 minutes"),
+        Line::from("X escalate the selected interruption to the top of the queue"),
+        Line::from("H snooze all review interruptions in the selected graph"),
+        Line::from("B escalate all blocker interruptions in the selected graph"),
         Line::from("s cycle status"),
         Line::from("p cycle priority"),
         Line::from("h send selected issue to an agent"),
@@ -1435,6 +1486,8 @@ fn empty_state_copy(app: &App) -> &'static str {
         "No scratch items yet. Press x to capture a note you want to turn into tracked work later."
     } else if app.is_interruptions_view() {
         "No open interruptions right now. Agent questions, blockers, and review requests will land here."
+    } else if app.saved_view == crate::app::SavedView::DispatchBoard {
+        "No active dispatch graphs yet. Split a parent issue with D and it will appear here as a supervision board."
     } else if app.saved_view == crate::app::SavedView::Done {
         "No done issues here yet. Close a loop and it will appear in this reviewable history."
     } else {

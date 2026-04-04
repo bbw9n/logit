@@ -78,6 +78,19 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn get_issue_by_identifier(&self, identifier: &str) -> Result<Option<Issue>> {
+        self.conn
+            .query_row(
+                "SELECT local_id, parent_id, remote_id, identifier, title, description, project, labels_json, status, priority, assignee, owner_type, owner_name, attention_reason, blocked_reason, closeout_summary, follow_up_needed, is_archived, sync_state, updated_at
+                 FROM issues
+                 WHERE identifier = ?1",
+                [identifier],
+                map_issue_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_scratch_items(&self) -> Result<Vec<ScratchItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, body, source, created_at, promoted_issue_id
@@ -245,7 +258,7 @@ impl Store {
 
     pub fn list_agent_requests_for_issue(&self, issue_local_id: i64) -> Result<Vec<AgentRequest>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at
+            "SELECT id, issue_local_id, kind, title, body, requested_by, status, snoozed_until, escalation_level, created_at, resolved_at
              FROM agent_requests
              WHERE issue_local_id = ?1
              ORDER BY created_at DESC, id DESC",
@@ -265,8 +278,8 @@ impl Store {
     ) -> Result<AgentRequest> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO agent_requests (issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, NULL)",
+            "INSERT INTO agent_requests (issue_local_id, kind, title, body, requested_by, status, snoozed_until, escalation_level, created_at, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', NULL, 0, ?6, NULL)",
             params![issue_local_id, kind.code(), title, body, requested_by, now],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -277,9 +290,33 @@ impl Store {
     pub fn resolve_agent_request(&self, request_id: i64) -> Result<Option<AgentRequest>> {
         self.conn.execute(
             "UPDATE agent_requests
-             SET status = 'resolved', resolved_at = ?2
+             SET status = 'resolved', resolved_at = ?2, snoozed_until = NULL
              WHERE id = ?1 AND status = 'open'",
             params![request_id, Utc::now().to_rfc3339()],
+        )?;
+        self.get_agent_request(request_id)
+    }
+
+    pub fn snooze_agent_request(
+        &self,
+        request_id: i64,
+        snoozed_until: DateTime<Utc>,
+    ) -> Result<Option<AgentRequest>> {
+        self.conn.execute(
+            "UPDATE agent_requests
+             SET snoozed_until = ?2
+             WHERE id = ?1 AND status = 'open'",
+            params![request_id, snoozed_until.to_rfc3339()],
+        )?;
+        self.get_agent_request(request_id)
+    }
+
+    pub fn escalate_agent_request(&self, request_id: i64) -> Result<Option<AgentRequest>> {
+        self.conn.execute(
+            "UPDATE agent_requests
+             SET escalation_level = escalation_level + 1, snoozed_until = NULL
+             WHERE id = ?1 AND status = 'open'",
+            [request_id],
         )?;
         self.get_agent_request(request_id)
     }
@@ -698,7 +735,7 @@ impl Store {
     fn get_agent_request(&self, id: i64) -> Result<Option<AgentRequest>> {
         self.conn
             .query_row(
-                "SELECT id, issue_local_id, kind, title, body, requested_by, status, created_at, resolved_at
+                "SELECT id, issue_local_id, kind, title, body, requested_by, status, snoozed_until, escalation_level, created_at, resolved_at
                  FROM agent_requests
                  WHERE id = ?1",
                 [id],
@@ -954,6 +991,8 @@ impl Store {
                 body TEXT NOT NULL,
                 requested_by TEXT NOT NULL,
                 status TEXT NOT NULL,
+                snoozed_until TEXT,
+                escalation_level INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 resolved_at TEXT
             );",
@@ -1016,6 +1055,25 @@ impl Store {
         {
             self.conn.execute(
                 "ALTER TABLE issues ADD COLUMN follow_up_needed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let agent_request_columns = self.table_columns("agent_requests")?;
+        if !agent_request_columns
+            .iter()
+            .any(|column| column == "snoozed_until")
+        {
+            self.conn.execute(
+                "ALTER TABLE agent_requests ADD COLUMN snoozed_until TEXT",
+                [],
+            )?;
+        }
+        if !agent_request_columns
+            .iter()
+            .any(|column| column == "escalation_level")
+        {
+            self.conn.execute(
+                "ALTER TABLE agent_requests ADD COLUMN escalation_level INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -1252,6 +1310,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     #[test]
     fn issue_crud_round_trip_works() -> Result<()> {
@@ -1610,6 +1669,31 @@ mod tests {
         assert_eq!(resolved.status, AgentRequestStatus::Resolved);
         Ok(())
     }
+
+    #[test]
+    fn agent_request_snooze_and_escalation_round_trip() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let issue = store.create_issue(&IssueDraft::new("Issue", "Has request"))?;
+        let request = store.create_agent_request(
+            issue.local_id,
+            AgentRequestKind::Question,
+            "Need answer",
+            "Please respond",
+            "worker-a",
+        )?;
+
+        let snoozed = store
+            .snooze_agent_request(request.id, Utc::now() + Duration::minutes(30))?
+            .expect("snoozed request should exist");
+        assert!(snoozed.snoozed_until.is_some());
+
+        let escalated = store
+            .escalate_agent_request(request.id)?
+            .expect("escalated request should exist");
+        assert_eq!(escalated.escalation_level, 1);
+        assert_eq!(escalated.snoozed_until, None);
+        Ok(())
+    }
 }
 
 fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -1646,9 +1730,15 @@ fn map_agent_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentReque
         body: row.get(4)?,
         requested_by: row.get(5)?,
         status: decode_agent_request_status(&row.get::<_, String>(6)?)?,
-        created_at: parse_dt(row.get::<_, String>(7)?).map_err(to_sql_conversion_error)?,
+        snoozed_until: row
+            .get::<_, Option<String>>(7)?
+            .map(parse_dt)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
+        escalation_level: row.get(8)?,
+        created_at: parse_dt(row.get::<_, String>(9)?).map_err(to_sql_conversion_error)?,
         resolved_at: row
-            .get::<_, Option<String>>(8)?
+            .get::<_, Option<String>>(10)?
             .map(parse_dt)
             .transpose()
             .map_err(to_sql_conversion_error)?,
